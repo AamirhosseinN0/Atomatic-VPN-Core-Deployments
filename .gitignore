@@ -1,0 +1,82 @@
+# ============================================================================
+#  DENY BY DEFAULT
+#
+#  This working directory can also hold generated client bundles, which contain
+#  private keys and cleartext VPN passwords. Rather than trying to blacklist
+#  every secret filename, everything is ignored and only the project's own files
+#  are allowed back in.
+#
+#  To add a new file to the repo, add an explicit "!" rule for it below.
+#  To allow a whole directory:   !docs/    and    !docs/**
+# ============================================================================
+
+*
+
+!.gitignore
+!README.md
+!LICENSE
+!iKev2_Deployment.sh
+
+# ----------------------------------------------------------------------------
+#  Second layer. These stay meaningful if the deny-by-default block above is
+#  ever relaxed, and they document exactly what must never be committed.
+# ----------------------------------------------------------------------------
+
+# Key material
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.csr
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Client profiles — embed a PKCS#12 and/or the VPN password in cleartext
+*.sswan
+*.mobileconfig
+*.ovpn
+
+# Generated client bundles and their instructions
+ikev2-clients/
+clients/
+*-windows-cert.ps1
+*-windows-userpass.ps1
+*-android-p12-password.txt
+README.txt
+**/README.txt
+README-*.txt
+
+# Deployment state: domain, public IP and pool layout of a live server
+ikev2.env
+*.env
+!.env.example
+
+# PKI database produced by `openssl ca`
+index.txt*
+serial*
+crlnumber*
+newcerts/
+
+# Logs
+*.log
+
+# Archives that may wrap any of the above
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Notes belonging to other projects
+GOALS.md
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

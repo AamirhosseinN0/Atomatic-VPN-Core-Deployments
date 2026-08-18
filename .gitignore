@@ -13,9 +13,12 @@
 *
 
 !.gitignore
+!.gitattributes
 !README.md
+!README-singbox.md
 !LICENSE
 !iKev2_Deployment.sh
+!Singbox_Deployment.sh
 
 # ----------------------------------------------------------------------------
 #  Second layer. These stay meaningful if the deny-by-default block above is

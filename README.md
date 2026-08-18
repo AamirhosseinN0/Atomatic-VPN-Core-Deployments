@@ -11,6 +11,12 @@ It also generates ready-to-use client bundles: an importable `.p12`, an Android
 sudo bash iKev2_Deployment.sh
 ```
 
+> **Also in this repo:** [`Singbox_Deployment.sh`](Singbox_Deployment.sh) — a
+> multi-protocol [**sing-box**](https://sing-box.sagernet.org) proxy deployer for
+> Ubuntu 22/24/26 (VLESS-Reality, Hysteria2, TUIC, Trojan, ShadowTLS, Shadowsocks-2022,
+> AnyTLS, NaiveProxy, VMess, and Snell v5/v6), with generated share links,
+> subscription, sing-box and Clash configs. See [README-singbox.md](README-singbox.md).
+
 ---
 
 ## Why another IKEv2 script

@@ -88,7 +88,7 @@ POOL_EAP="10.20.10.0/24"
 POOL_CERT_WIN="10.20.11.0/24"
 POOL_CERT_AND="10.20.12.0/24"
 ENABLE_IPV6="no"
-POOL_V6="fd42:1ke:v2::/64"
+POOL_V6="fd42:1020::/64"
 
 DNS_SERVERS="1.1.1.1,8.8.8.8"
 SPLIT_INCLUDE=""            # empty = full tunnel; else e.g. "10.0.0.0/8,192.168.0.0/16"
@@ -727,7 +727,12 @@ install_packages() {
   echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
 
   log "apt-get update ..."
-  apt-get update -qq
+  # A stalled mirror must not hang the whole deploy — bound it and retry once.
+  if ! timeout 300 apt-get update -qq; then
+    warn "apt-get update failed (slow mirrors?) — retrying once in 5s ..."
+    sleep 5
+    timeout 300 apt-get update -qq || warn "apt-get update still failing; attempting the install anyway."
+  fi
 
   local base=(
     strongswan strongswan-swanctl strongswan-pki
@@ -736,11 +741,11 @@ install_packages() {
     zip unzip uuid-runtime chrony
   )
   log "Installing: ${base[*]}"
-  if ! apt-get install -y -qq "${base[@]}" >/dev/null 2>&1; then
+  if ! timeout 900 apt-get install -y -qq "${base[@]}" >/dev/null 2>&1; then
     warn "Batch install failed — retrying package by package to isolate the problem."
     local pkg missing=()
     for pkg in "${base[@]}"; do
-      apt-get install -y -qq "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+      timeout 600 apt-get install -y -qq "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
     done
     if (( ${#missing[@]} > 0 )); then
       warn "Could not install: ${missing[*]}"
@@ -2372,11 +2377,23 @@ BANNER
 
 install_self() {
   local target="/usr/local/sbin/ikev2ctl"
-  local src; src="$(readlink -f "${BASH_SOURCE[0]}")"
-  if [[ $src != "$target" ]]; then
-    install -m 0700 "$src" "$target"
-    ok "Installed as ${target}"
+  local src; src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  # Piping the script in (`bash <(curl ...)`, `curl ... | bash`) leaves
+  # BASH_SOURCE pointing at a /dev/fd entry or a name that no longer exists, and
+  # `install` then fails with "cannot stat". That must not look like a deploy
+  # error — everything else has already succeeded by this point.
+  if [[ -z $src || ! -f $src ]]; then
+    warn "This script is not on disk as a regular file (piped in?), so ${target} was not installed."
+    warn "Save it to the server and re-run to get the ikev2ctl helper, or call the file directly."
+    return 0
   fi
+  [[ $src == "$target" ]] && return 0
+  if install -m 0700 "$src" "$target" 2>/dev/null; then
+    ok "Installed as ${target}"
+  else
+    warn "Could not install ${target}; use the script directly instead."
+  fi
+  return 0
 }
 
 # -----------------------------------------------------------------------------

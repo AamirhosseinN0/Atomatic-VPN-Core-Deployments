@@ -24,7 +24,7 @@ diagnose from the client's generic error codes. This script encodes the fixes:
 | Constraint | What breaks without it | Handled by |
 |---|---|---|
 | Stock Windows ESP offers **SHA-1 only** (`aes256/aes128/3des/des/null`) | Tunnel negotiates then dies | `aes256-sha1` kept in `esp_proposals` |
-| Stock Windows IKE DH is **modp1024**; a server-initiated rekey needs modp2048 listed first | Drops after ~4 h | `modp2048` heads the proposal list |
+| Stock Windows IKE DH is **modp1024**; a server-initiated rekey needs modp2048 listed first | Drops after ~4 h | `modp2048` heads the proposal list (compat/balanced) |
 | An ESP proposal carrying a DH group the client never configured | Error **13816** | Non-PFS proposals ordered first |
 | Server cert needs EKU `serverAuth` **+** `1.3.6.1.5.5.8.2.2`, and the IP must be a **`DNS:`** SAN | Error **13801** | SAN = `DNS:<domain>, DNS:<ip>, IP:<ip>` |
 | Windows **cannot import PBES2/AES-256 PKCS#12** — OpenSSL 3's default | `.p12` import silently rejected | Built with `PBE-SHA1-3DES` + SHA-1 MAC, then verified |
@@ -42,14 +42,14 @@ diagnose from the client's generic error codes. This script encodes the fixes:
 - UDP **500** and **4500** reachable
 
 > **Cloudflare users:** the A record must be **DNS only** (grey cloud). IKEv2 is UDP;
-> Cloudflare's proxy cannot carry it. The script detects proxied records and stops.
+> Cloudflare's proxy cannot carry it. The script warns when it detects a proxied record.
 
 ---
 
 ## Quick start
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/iKev2_Deployment.sh | sudo bash
+wget -qO iKev2_Deployment.sh https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/iKev2_Deployment.sh && sudo bash iKev2_Deployment.sh
 ```
 
 The script asks for everything it needs — domain and public IP are required, the rest
@@ -74,6 +74,7 @@ ikev2ctl revoke-client --name bob   # revokes the cert, regenerates the CRL
 ikev2ctl status                     # live IKE/CHILD SAs
 ikev2ctl check                      # re-run every health check
 ikev2ctl repair-md4                 # re-apply the EAP-MSCHAPv2 / MD4 fix
+ikev2ctl uninstall                  # remove configuration (packages kept)
 ```
 
 Each client bundle lands in `/root/ikev2-clients/<name>/` (plus a `.zip`) and contains:
@@ -85,8 +86,12 @@ Each client bundle lands in `/root/ikev2-clients/<name>/` (plus a `.zip`) and co
 | `<name>-windows-cert.ps1` | Installs CA + cert + VPN profile |
 | `<name>-windows-userpass.ps1` | Installs CA + username/password VPN profile |
 | `<name>-android-cert.sswan` | strongSwan app, certificate |
+| `<name>-android.p12` | Manual Android certificate import |
+| `<name>-android-p12-password.txt` | Its export password (a secret) |
 | `<name>-android-userpass.sswan` | strongSwan app, username/password |
 | `README.txt` | Per-client instructions and credentials |
+
+Only the files for the chosen platform/auth combination are written — e.g. `--auth eap` produces no `.p12` or certificate profiles.
 
 ---
 
@@ -95,7 +100,7 @@ Each client bundle lands in `/root/ikev2-clients/<name>/` (plus a `.zip`) and co
 | Option | Default | Notes |
 |---|---|---|
 | `--domain <fqdn>` | *required* | What clients type; goes into the cert SAN |
-| `--ip <ipv4>` | *required* | Public address; also added as a `DNS:` SAN |
+| `--ip <ipv4>` | *required* | Public address; also added as a `DNS:` SAN (self-signed mode only) |
 | `--cert-mode self\|letsencrypt` | `self` | Let's Encrypt means no CA to install on clients |
 | `--key-type rsa\|ecdsa` | `rsa` | Windows accepts RSA, P-256, P-384 only |
 | `--profile compat\|balanced\|strict` | `compat` | See below |
@@ -106,17 +111,22 @@ Each client bundle lands in `/root/ikev2-clients/<name>/` (plus a `.zip`) and co
 | `--ipv6 yes\|no` | `no` | Adds an IPv6 ULA pool |
 | `--firewall auto\|ufw\|iptables\|none` | `auto` | |
 | `--no-kernel-tuning` | tuning on | sysctl, BBR, conntrack, MSS clamp |
+| `-y, --yes` | interactive | Unattended; requires `--domain` and `--ip` |
+| `--le-email <email>` | — | Let's Encrypt contact (blank = register without one) |
+| `--skip-preflight` | checks on | Skip the pre-flight checks (escape hatch) |
 
 ### Crypto profiles
 
 | Profile | IKE | ESP | Windows setup |
 |---|---|---|---|
 | `compat` | includes modp1024 / 3DES for stock Windows | includes `aes256-sha1` | nothing to configure |
-| `balanced` | AES-256 + SHA-256, modp2048 / ECP384 | AES-256 + SHA-256 | run the generated `.ps1` |
-| `strict` | AES-256-GCM + ECP384 only | AES-256-GCM + ECP384 | **must** run the generated `.ps1` |
+| `balanced` | AES-256 + SHA-256, modp2048 / ECP384 | AES-256 + SHA-256 (+ GCM/SHA-1 fallbacks) | run the generated `.ps1` |
+| `strict` | AES-256-GCM + ECP384/SHA-384 | AES-256-GCM + ECP384/SHA-384 | **must** run the generated `.ps1` |
 
 `compat` is the default so the built-in Windows dialog works with zero client-side
 configuration. Choose `balanced` or `strict` if every client will run the `.ps1`.
+
+`strict` drops legacy crypto but keeps AES-CBC/SHA-2 fallbacks so rekeys never fail outright.
 
 ---
 
@@ -167,7 +177,7 @@ This makes per-group firewall and routing rules straightforward.
 
 ```bash
 ikev2ctl check                                  # every health check, with fixes
-journalctl -u strongswan-swanctl.service -f     # daemon log
+journalctl -u strongswan-swanctl.service -f   # or strongswan.service — ikev2ctl check names the active unit
 tail -f /var/log/strongswan.log                 # charon log
 swanctl --list-sas                              # live sessions
 ss -lunp | grep -E ':500|:4500'                 # is charon actually bound?

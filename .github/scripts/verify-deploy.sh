@@ -11,11 +11,12 @@
 #   - a per-script extra check (e.g. charon bound to UDP 500/4500)
 #
 # Required env:
-#   CLI          absolute path of the management CLI
 #   SERVICE      systemd unit name
 #   CLIENTS_DIR  where the client bundle was written
 #   SYSCTL_FILE  kernel-tuning drop-in the README promises
 # Optional env:
+#   CLI            absolute path of the management CLI (skipped when empty —
+#                  a piped one-step run legitimately cannot install it)
 #   BUNDLE_FILES   space-separated files that must exist and be non-empty
 #   JSON_GLOB      glob (expanded as root) of JSON client configs to validate
 #   EXTRA_CHECK_NAME / EXTRA_CHECK_CMD   one extra bash snippet, run via sudo
@@ -38,13 +39,15 @@ run() { # run "description" command [args...]
   fi
 }
 
-CLI_NAME="$(basename "${CLI:?}")"
-
 # 1. Management CLI installed and healthy — README: "a check command re-runs
-#    every health check" / "A management CLI stays behind"
-run "${CLI_NAME} is installed at ${CLI}" sudo test -x "$CLI"
-run "${CLI_NAME} check exits 0"            sudo "$CLI" check
-run "${CLI_NAME} status exits 0"           sudo "$CLI" status
+#    every health check" / "A management CLI stays behind". Skipped for piped
+#    runs, where installing it is impossible by design.
+if [[ -n "${CLI:-}" ]]; then
+  CLI_NAME="$(basename "$CLI")"
+  run "${CLI_NAME} is installed at ${CLI}" sudo test -x "$CLI"
+  run "${CLI_NAME} check exits 0"            sudo "$CLI" check
+  run "${CLI_NAME} status exits 0"           sudo "$CLI" status
+fi
 
 # 2. Service active — README: "turns a fresh Ubuntu server into a working node"
 run "service '${SERVICE:?}' is active" systemctl is-active --quiet "$SERVICE"

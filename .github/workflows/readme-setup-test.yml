@@ -147,10 +147,11 @@ jobs:
           if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
-  # Singbox — the main README's "one-step run" pipe form, run against the
-  # exact commit under test (SHA-pinned raw URL), with README-singbox.md's
-  # unattended flags adapted to --cert-mode self (documented mode) because a
-  # runner has no DNS / inbound port 80 for Let's Encrypt.
+  # Singbox — the main README's "one-step run" command (download to file, then
+  # run), fetched from the exact commit under test (SHA-pinned raw URL), with
+  # README-singbox.md's unattended flags adapted to --cert-mode self (a
+  # documented mode) because a runner has no DNS / inbound port 80 for
+  # Let's Encrypt.
   # ---------------------------------------------------------------------------
   singbox:
     name: "Singbox / ubuntu-24.04"
@@ -171,7 +172,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fresh setup — README one-step pipe command
+      - name: Fresh setup — README one-step command
         run: |
           set -euo pipefail
           RAW="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/Singbox_Deployment.sh"
@@ -187,8 +188,9 @@ jobs:
             echo "::error::raw URL did not serve commit ${GITHUB_SHA} within 3 minutes"
             exit 1
           fi
-          echo "DEPLOY_CMD=wget -qO- ${RAW} | sudo bash -s -- -y --domain ${TEST_DOMAIN} --protocols all --cert-mode self" >> "$GITHUB_ENV"
-          wget -qO- "$RAW" | sudo bash -s -- -y --domain "$TEST_DOMAIN" --protocols all --cert-mode self 2>&1 | tee deploy.log
+          echo "DEPLOY_CMD=wget -qO Singbox_Deployment.sh ${RAW} && sudo bash Singbox_Deployment.sh -y --domain ${TEST_DOMAIN} --protocols all --cert-mode self" >> "$GITHUB_ENV"
+          wget -qO Singbox_Deployment.sh "$RAW"
+          sudo bash Singbox_Deployment.sh -y --domain "$TEST_DOMAIN" --protocols all --cert-mode self 2>&1 | tee deploy.log
           touch deploy.ok
 
       - name: Verify README promises
@@ -258,6 +260,111 @@ jobs:
         if: always()
         with:
           name: report-singbox
+          path: report/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Singbox (piped) — the README's documented pipe alternative
+  # (`wget -qO- … | sudo bash`). By design a piped script cannot install
+  # singboxctl, so this job verifies only the pipe form's own promises:
+  # deploy exits 0, service active, bundle written. Also covers sing-box on
+  # Ubuntu 22.04. Uses certificate-less protocols only.
+  # ---------------------------------------------------------------------------
+  singbox-pipe:
+    name: "Singbox piped / ubuntu-22.04"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      SERVICE: sing-box
+      CLIENTS_DIR: /root/singbox-clients
+      SYSCTL_FILE: /etc/sysctl.d/99-singbox.conf
+      BUNDLE_FILES: >-
+        /root/singbox-clients/links.txt
+        /root/singbox-clients/subscription.txt
+        /root/singbox-clients/client-singbox.json
+        /root/singbox-clients/README.txt
+      JSON_GLOB: "/root/singbox-clients/client-*.json"
+      EXTRA_CHECK_NAME: "piped run skips singboxctl by design and says so"
+      EXTRA_CHECK_CMD: "grep -q 'was not installed' deploy.log"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fresh setup — README piped alternative
+        run: |
+          set -euo pipefail
+          RAW="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/Singbox_Deployment.sh"
+          echo "DEPLOY_CMD=wget -qO- ${RAW} | sudo bash -s -- -y --domain ${TEST_DOMAIN} --protocols vless-reality,ss2022" >> "$GITHUB_ENV"
+          wget -qO- "$RAW" | sudo bash -s -- -y --domain "$TEST_DOMAIN" --protocols vless-reality,ss2022 2>&1 | tee deploy.log
+          touch deploy.ok
+
+      - name: Verify README promises (pipe form)
+        if: always()
+        run: bash .github/scripts/verify-deploy.sh
+
+      - name: Assemble job report
+        if: always()
+        run: |
+          set -u
+          mkdir -p report
+          {
+            echo "# singbox-pipe (ubuntu-22.04) — run ${{ github.run_id }}"
+            echo
+            echo "- commit: [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "- image: ${ImageOS:-unknown} / $(uname -rm)"
+            echo "- deploy command: \`${DEPLOY_CMD:-<not recorded>}\`"
+            echo "- deploy status: $(if [[ -f deploy.ok ]]; then echo OK; else echo FAILED; fi)"
+            echo
+            echo "## Verification"
+            echo '```'
+            cat verify.log 2>/dev/null || echo "(verify step did not run)"
+            echo '```'
+            echo
+            echo "## Deploy log (last 120 lines)"
+            echo '```'
+            tail -n 120 deploy.log 2>/dev/null || echo "(no deploy.log)"
+            echo '```'
+            echo
+            echo "## Service status"
+            echo '```'
+            sudo systemctl status "$SERVICE" --no-pager -l 2>&1 | head -n 30 || true
+            echo '```'
+            echo
+            echo "## Service journal (last 60 lines)"
+            echo '```'
+            sudo journalctl -u "$SERVICE" --no-pager -n 60 2>&1 || true
+            echo '```'
+            echo
+            echo "## Client bundle listing"
+            echo '```'
+            sudo ls -laR "$CLIENTS_DIR" 2>&1 | head -n 80 || true
+            echo '```'
+            echo
+            echo "## sysctl drop-in (first 20 lines)"
+            echo '```'
+            sudo head -n 20 "$SYSCTL_FILE" 2>&1 || true
+            echo '```'
+          } | sed -E \
+              -e 's#((vless|vmess|trojan|hy2|hysteria2|tuic|anytls|ss|snell|socks|naive)://)[^[:space:]]+#\1<redacted>#g' \
+              -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<uuid>/g' \
+              -e 's/[A-Za-z0-9+/=]{40,}/<redacted-blob>/g' \
+              -e 's/(password|passwd|psk|secret|token|uuid|private)[=: ][^[:space:]]+/\1=<redacted>/Ig' \
+              > report/singbox-pipe.md
+          {
+            if [[ -f deploy.ok ]]; then echo "deploy: OK"; else echo "deploy: FAILED"; fi
+            if [[ -f verify.log ]]; then
+              echo "verify: $(grep -c '^PASS:' verify.log || true) passed, $(grep -c '^FAIL:' verify.log || true) failed"
+            else
+              echo "verify: not run"
+            fi
+          } > report/status
+          cp deploy.log report/ 2>/dev/null || true
+          cp verify.log report/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-singbox-pipe
           path: report/
           retention-days: 7
           if-no-files-found: warn
@@ -472,7 +579,7 @@ jobs:
   # ---------------------------------------------------------------------------
   report:
     name: "Publish test report"
-    needs: [ikev2, singbox, xray, mihomo]
+    needs: [ikev2, singbox, singbox-pipe, xray, mihomo]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10

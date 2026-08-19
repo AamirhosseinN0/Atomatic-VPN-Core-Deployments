@@ -15,27 +15,32 @@ No Ansible, no Docker, no clone needed — `wget` one file and run it.
 
 ## One-step run
 
-On a fresh Ubuntu server — each command downloads and runs one deployer. The scripts
-ask their questions on the terminal, not the pipe, so these stay fully interactive:
+On a fresh Ubuntu server — each command downloads one deployer and runs it. The
+script stays on disk, so you keep it for re-runs and get the management CLI:
 
 ```bash
 # IKEv2/IPsec VPN gateway for Windows + Android (strongSwan)
-wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/iKev2_Deployment.sh | sudo bash
+wget -qO iKev2_Deployment.sh https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/iKev2_Deployment.sh && sudo bash iKev2_Deployment.sh
 
 # sing-box proxy node
-wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Singbox_Deployment.sh | sudo bash
+wget -qO Singbox_Deployment.sh https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Singbox_Deployment.sh && sudo bash Singbox_Deployment.sh
 
 # Xray-core proxy node
-wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Xray_Deployment.sh | sudo bash
+wget -qO Xray_Deployment.sh https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Xray_Deployment.sh && sudo bash Xray_Deployment.sh
 
 # mihomo (Clash.Meta) proxy node
-wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Mihomo_Deployment.sh | sudo bash
+wget -qO Mihomo_Deployment.sh https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Mihomo_Deployment.sh && sudo bash Mihomo_Deployment.sh
 ```
+
+Piping works too (`wget -qO- … | sudo bash`) with one difference: a script arriving
+on a pipe cannot install the management CLI, so the deployer skips that step and
+says so. All questions are asked on the terminal either way.
 
 Flags pass straight through for unattended runs:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Singbox_Deployment.sh | sudo bash -s -- -y --domain vpn.example.com
+wget -qO Singbox_Deployment.sh https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Singbox_Deployment.sh
+sudo bash Singbox_Deployment.sh -y --domain vpn.example.com
 ```
 
 ---
@@ -45,7 +50,7 @@ wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Dep
 | Script | Turns a fresh Ubuntu server into… | Docs |
 |---|---|---|
 | [`iKev2_Deployment.sh`](iKev2_Deployment.sh) | an **IKEv2/IPsec VPN gateway** (strongSwan) for Windows 10/11 and Android, with username/password **and** certificate auth | [README-ikev2.md](README-ikev2.md) |
-| [`Singbox_Deployment.sh`](Singbox_Deployment.sh) | a **[sing-box](https://sing-box.sagernet.org)** proxy node — VLESS-Reality, Hysteria2, TUIC, Trojan, AnyTLS, ShadowTLS, Shadowsocks-2022, NaiveProxy, VMess, Snell v5/v6 | [README-singbox.md](README-singbox.md) |
+| [`Singbox_Deployment.sh`](Singbox_Deployment.sh) | a **[sing-box](https://sing-box.sagernet.org)** proxy node — VLESS-Reality, VLESS-WS, Hysteria2, TUIC, Trojan, AnyTLS, ShadowTLS, Shadowsocks-2022, NaiveProxy, VMess, Snell v5/v6 | [README-singbox.md](README-singbox.md) |
 | [`Xray_Deployment.sh`](Xray_Deployment.sh) | an **[Xray-core](https://xtls.github.io)** proxy node — VLESS-Reality/Vision, XHTTP, post-quantum VLESS Encryption, Trojan, VMess, Hysteria2, SS-2022, and a fallbacks mode hiding several protocols behind one HTTPS port | [README-xray.md](README-xray.md) |
 | [`Mihomo_Deployment.sh`](Mihomo_Deployment.sh) | a **[mihomo](https://github.com/MetaCubeX/mihomo) (Clash.Meta)** node — 74 protocol × transport × camouflage combinations, including ShadowQUIC, Mieru, Sudoku, TrustTunnel, JLS/RestLS, mKCP/Mekya and Snell v1–v4 | [README-mihomo.md](README-mihomo.md) |
 
@@ -85,8 +90,9 @@ wget https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployme
 sudo bash Singbox_Deployment.sh
 ```
 
-Interactive by default — every question has a sensible default you can accept with
-ENTER — or fully unattended:
+Interactive by default — nearly every question has a sensible default you can accept
+with ENTER (the IKEv2 deployer also requires a domain and public IP) — or fully
+unattended:
 
 ```bash
 sudo bash Singbox_Deployment.sh -y --domain vpn.example.com --protocols all --cert-mode letsencrypt
@@ -102,8 +108,9 @@ Each README lists that script's full option set and unattended examples.
 - **One self-contained file** — nothing to install beyond a stock Ubuntu system
 - **Secrets generated** — keys, UUIDs and passwords are created, never reused
 - **Certificates handled** — Let's Encrypt when a protocol wants TLS, automatic
-  self-signed fallback if issuance fails; REALITY / ShadowTLS / JLS-style camouflage
-  needs no certificate at all
+  self-signed fallback if issuance fails (the three proxy deployers; the IKEv2
+  deployer stops instead); REALITY / ShadowTLS / JLS-style camouflage needs no
+  certificate at all
 - **Ports found, not asked for** (proxy deployers) — every protocol gets a port that is
   verified free, TCP and UDP tracked separately
 - **Config validated before the service restarts**, and a `check` command re-runs every
@@ -115,7 +122,8 @@ Each README lists that script's full option set and unattended examples.
 - **Client bundles written to `/root/*-clients/`** — share links, a base64 subscription
   and per-core client configs; `--serve-sub` (proxy deployers) also serves them over HTTP
 - **A management CLI stays behind** — `ikev2ctl`, `singboxctl`, `xrayctl`, `mihomoctl` —
-  for status, health checks, updates and node management
+  for status, health checks and node management, plus updates on the three proxy
+  deployers
 
 ---
 

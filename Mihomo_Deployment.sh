@@ -1004,11 +1004,17 @@ install_deps() {
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
   echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" | debconf-set-selections 2>/dev/null || true
   echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections 2>/dev/null || true
-  log "apt-get update ..."; apt-get update -qq || warn "apt-get update reported errors."
+  log "apt-get update ..."
+  # A stalled mirror must not hang the whole deploy — bound it and retry once.
+  if ! timeout 300 apt-get update -qq; then
+    warn "apt-get update failed (slow mirrors?) — retrying once in 5s ..."
+    sleep 5
+    timeout 300 apt-get update -qq || warn "apt-get update reported errors."
+  fi
   local base=(curl ca-certificates jq openssl gzip zip iproute2 dnsutils)
-  apt-get install -y -qq "${base[@]}" >/dev/null 2>&1 || {
+  timeout 900 apt-get install -y -qq "${base[@]}" >/dev/null 2>&1 || {
     warn "Batch dependency install failed; retrying individually."
-    local p; for p in "${base[@]}"; do apt-get install -y -qq "$p" >/dev/null 2>&1 || warn "could not install $p"; done
+    local p; for p in "${base[@]}"; do timeout 600 apt-get install -y -qq "$p" >/dev/null 2>&1 || warn "could not install $p"; done
   }
   have jq      || die "jq is required and could not be installed."
   have openssl || die "openssl is required and could not be installed."

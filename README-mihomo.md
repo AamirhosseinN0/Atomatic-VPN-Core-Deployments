@@ -210,7 +210,33 @@ sudo bash Mihomo_Deployment.sh regen-sub       # rebuild client bundles from sta
 sudo bash Mihomo_Deployment.sh uninstall       # remove configuration
 ```
 
-After a deploy the script installs itself as `/usr/local/sbin/mihomoctl`.
+After a deploy the script installs itself as `/usr/local/sbin/mihomoctl` (when run from a saved file — a piped `wget -O- … | bash` run skips this and says so).
+
+---
+
+## Options
+
+| Option | Default | Notes |
+|---|---|---|
+| `-y`, `--yes` | off | Non-interactive; requires `--domain` |
+| `--domain <fqdn>` | *required* | e.g. `vpn.example.com`; no default |
+| `--ip <ipv4>` | auto-detected | Public IPv4 |
+| `--channel <stable\|alpha\|pinned>` | `stable` | `alpha` = rolling `Prerelease-Alpha` build |
+| `--version <tag>` | — | Exact tag for `--channel pinned`, e.g. `v1.19.30` |
+| `--amd64-level <auto\|v1\|v2\|v3>` | `auto` | Plain `amd64` asset is a v3 build; see the amd64 trap |
+| `--protocols <all\|recommended\|core\|list>` | `all` | Keys, families or security layers, comma-separated |
+| `--listen <addr>` | `::` | Bare IP; `::` dual-stack, `0.0.0.0` v4-only |
+| `--cert-mode <letsencrypt\|self>` | `letsencrypt` | Only if a selected protocol wants a cert |
+| `--le-email <email>` | — | Let's Encrypt contact |
+| `--reality-sni <host>` | `www.microsoft.com` | REALITY steal target |
+| `--steal-sni <host>` | `www.apple.com` | ShadowTLS / RestLS / JLS / TLS-mirror / ShadowQUIC decoy |
+| `--ss-method <cipher>` | `2022-blake3-aes-128-gcm` | Shadowsocks cipher |
+| `--snell-version <1..4>` | `4` | Snell protocol version |
+| `--api-listen <ip:port>` | `127.0.0.1:9090` | RESTful controller; `''` disables |
+| `--no-kernel-tuning` | tuning on | |
+| `--firewall <auto\|ufw\|iptables\|none>` | `auto` | |
+| `--serve-sub` | off | Also serve the subscription over plain HTTP |
+| `--skip-preflight` | off | Skip pre-flight checks |
 
 ---
 
@@ -223,7 +249,7 @@ security-layer families, comma-separated:
 # just the certificate-less camouflage layers
 sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols reality,jls,shadowtls
 
-# everything QUIC-based
+# every UDP-based listener (QUIC + mKCP/KCPTun)
 sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols quic
 
 # the mihomo-exclusive protocols plus a couple of classics
@@ -238,7 +264,7 @@ sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols recommend
 | `all` | every valid combination (74) — the default |
 | `recommended` | a curated 14 covering every distinct technique |
 | `core` | the 8 classics the sing-box / Xray scripts also offer |
-| families | `vless` `vmess` `trojan` `anytls` `ss` `snell` `quic` `exotic` |
+| families | `vless` `vmess` `trojan` `anytls` `ss` `snell` `mieru` `sudoku` `trusttunnel` `shadowquic` `quic` `exotic` |
 | by security | `reality` `shadowtls` `restls` `jls` `tls` |
 | by transport | `ws` `grpc` `xhttp` `mkcp` `mekya` `kcptun` |
 

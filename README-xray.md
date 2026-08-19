@@ -27,7 +27,7 @@ You choose **all** protocols or just a few:
 | `hysteria2` | Hysteria2 (QUIC/UDP) — native in Xray since v26.3.27 | yes |
 | `ss2022` | Shadowsocks 2022 (TCP+UDP) | none |
 
-Each deployment writes four client artefacts to `/root/xray-clients/`:
+Each deployment writes six client artefacts to `/root/xray-clients/`:
 
 | File | For |
 |---|---|
@@ -36,6 +36,7 @@ Each deployment writes four client artefacts to `/root/xray-clients/`:
 | `client-xray.json` | Xray client config — understands **every** protocol here |
 | `client-singbox.json` | sing-box client config (compatible subset — see below) |
 | `client-clash.yaml` | mihomo / Clash.Meta config |
+| `README.txt` | port map, credentials, per-protocol client notes |
 
 ---
 
@@ -83,7 +84,7 @@ Fully unattended, a subset of protocols:
 sudo bash Xray_Deployment.sh -y --domain vpn.example.com --protocols vless-reality,hysteria2,ss2022
 ```
 
-Afterwards the script installs itself as `/usr/local/sbin/xrayctl`:
+Afterwards the script installs itself as `/usr/local/sbin/xrayctl` (when run from a saved file — a piped `wget -O- … | bash` run skips this and says so):
 
 ```bash
 xrayctl info        # reprint links / subscription / credentials
@@ -104,7 +105,7 @@ xrayctl uninstall   # remove configuration
 | `--ip <ipv4>` | auto-detected | |
 | `--channel <latest\|stable\|pinned>` | `latest` | |
 | `--version <tag>` | | implies `--channel pinned` |
-| `--protocols <all\|list>` | `all` | comma list of keys or menu numbers |
+| `--protocols <all\|list>` | `all` | comma list of keys (menu numbers work at the interactive prompt only) |
 | `--port-mode <dedicated\|fallback>` | `dedicated` | |
 | `--fallback-dest <target>` | none | catch-all decoy, e.g. `80` |
 | `--cert-mode <letsencrypt\|self>` | `letsencrypt` | |
@@ -112,6 +113,9 @@ xrayctl uninstall   # remove configuration
 | `--firewall <auto\|ufw\|iptables\|none>` | `auto` | |
 | `--no-kernel-tuning` | tuning on | |
 | `--serve-sub` | off | serve the subscription over HTTP at a secret path |
+| `-y, --yes` | off | Unattended; requires `--domain` |
+| `--le-email <email>` | — | Let's Encrypt contact (blank = register without one) |
+| `--skip-preflight` | off | Skip the OS/arch/DNS pre-flight checks |
 
 ---
 
@@ -128,7 +132,7 @@ that silently fail:
 | Trojan, Shadowsocks 2022 | yes | yes | yes |
 | Hysteria2 | yes | yes | yes |
 | **XHTTP** | yes | **no** | yes (VLESS only) |
-| **VLESS Encryption** | yes | **no** | yes |
+| **VLESS Encryption** | yes | **no** | **no** |
 
 `client-singbox.json` therefore contains only the protocols upstream sing-box implements.
 Use `client-xray.json` for XHTTP and VLESS Encryption nodes.
@@ -192,8 +196,9 @@ Obsolete keys that old guides still set (`tcp_tw_recycle`, `tcp_low_latency`,
 - `--serve-sub` publishes your credentials over **plain HTTP** at a secret path. It is a
   convenience for the first import, not a long-term hosting solution — the token in the
   URL is the only access control.
-- The service runs as `nobody`; certificates are chowned to that user rather than
-  loosening their permissions.
+- The service runs as an unprivileged user (`nobody` with the official installer's
+  unit, `xray` with the built-in fallback unit); certificates are chowned to that
+  user rather than loosening their permissions.
 - Routing blocks clients from reaching the server's own private ranges and loopback.
 - Nothing server-specific is committed — `.gitignore` is deny-by-default and blocks keys,
   bundles and state files.

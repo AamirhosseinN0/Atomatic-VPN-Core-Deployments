@@ -676,11 +676,17 @@ install_deps() {
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
   echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" | debconf-set-selections 2>/dev/null || true
   echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections 2>/dev/null || true
-  log "apt-get update ..."; apt-get update -qq || warn "apt-get update reported errors."
+  log "apt-get update ..."
+  # A stalled mirror must not hang the whole deploy — bound it and retry once.
+  if ! timeout 300 apt-get update -qq; then
+    warn "apt-get update failed (slow mirrors?) — retrying once in 5s ..."
+    sleep 5
+    timeout 300 apt-get update -qq || warn "apt-get update reported errors."
+  fi
   local base=(curl ca-certificates jq openssl unzip zip iproute2 dnsutils tar)
-  apt-get install -y -qq "${base[@]}" >/dev/null 2>&1 || {
+  timeout 900 apt-get install -y -qq "${base[@]}" >/dev/null 2>&1 || {
     warn "Batch dependency install failed; retrying individually."
-    local p; for p in "${base[@]}"; do apt-get install -y -qq "$p" >/dev/null 2>&1 || warn "could not install $p"; done
+    local p; for p in "${base[@]}"; do timeout 600 apt-get install -y -qq "$p" >/dev/null 2>&1 || warn "could not install $p"; done
   }
   have jq || die "jq is required and could not be installed."
   have openssl || die "openssl is required and could not be installed."
@@ -1761,10 +1767,23 @@ do_uninstall() {
 
 install_self() {
   local target="/usr/local/sbin/singboxctl"
-  local src; src="$(readlink -f "${BASH_SOURCE[0]}")"
-  if [[ $src != "$target" ]]; then
-    install -m 0700 "$src" "$target" && ok "Installed as ${target}"
+  local src; src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  # Piping the script in (`bash <(curl ...)`, `curl ... | bash`) leaves
+  # BASH_SOURCE pointing at a /dev/fd entry or a name that no longer exists, and
+  # `install` then fails with "cannot stat". That must not look like a deploy
+  # error — everything else has already succeeded by this point.
+  if [[ -z $src || ! -f $src ]]; then
+    warn "This script is not on disk as a regular file (piped in?), so ${target} was not installed."
+    warn "Save it to the server and re-run to get the singboxctl helper, or call the file directly."
+    return 0
   fi
+  [[ $src == "$target" ]] && return 0
+  if install -m 0700 "$src" "$target" 2>/dev/null; then
+    ok "Installed as ${target}"
+  else
+    warn "Could not install ${target}; use the script directly instead."
+  fi
+  return 0
 }
 
 # -----------------------------------------------------------------------------

@@ -32,7 +32,7 @@ sudo bash Singbox_Deployment.sh -y --domain vpn.example.com --protocols all --ce
 
 ## Protocols
 
-Choose `all` or any comma-separated subset (keys or menu numbers):
+Choose `all` or any comma-separated subset (keys; menu numbers work at the interactive prompt only):
 
 | Key | Protocol | Cert | Share link | Clash YAML | sing-box JSON |
 |---|---|:---:|:---:|:---:|:---:|
@@ -111,7 +111,7 @@ scp -r root@SERVER_IP:/root/singbox-clients .
 
 ## Managing the node
 
-After deployment the script installs itself as `singboxctl`:
+After deployment the script installs itself as `singboxctl` (when run from a saved file — a piped `wget -O- … | bash` run skips this and says so):
 
 ```bash
 singboxctl info        # reprint links / subscription / credentials
@@ -121,6 +121,8 @@ singboxctl update      # upgrade sing-box to the latest build in the channel
 singboxctl regen-sub   # rebuild the client bundles from saved state
 singboxctl uninstall   # remove config (keeps the binaries)
 ```
+
+Running `singboxctl` with no subcommand (or `singboxctl deploy`) re-runs the interactive deployment.
 
 ## Options
 
@@ -138,6 +140,8 @@ singboxctl uninstall   # remove config (keeps the binaries)
 | `--firewall <auto\|ufw\|iptables\|none>` | `auto` | |
 | `--no-kernel-tuning` | tuning on | |
 | `--serve-sub` | off | Host the subscription over HTTP |
+| `-y, --yes` | off | Unattended; requires `--domain` |
+| `--skip-preflight` | off | Skip the OS/arch/DNS pre-flight checks |
 
 ## Requirements
 

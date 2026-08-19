@@ -1300,13 +1300,43 @@ make_self_signed() {
   return 0
 }
 
+# certbot's HTTP-01 challenge needs inbound tcp/80, but firewall_setup does not
+# run until after the certificate step. On a host where ufw is ALREADY active —
+# precisely the case `--firewall auto` detects — the challenge would be dropped,
+# issuance would fail, and the deploy would fall back to a self-signed cert for
+# no good reason. So open :80 for the duration of the request and close it again
+# afterwards; firewall_setup re-adds it permanently if issuance succeeded.
+HTTP80_OPENED="no"
+_http01_open() {
+  HTTP80_OPENED="no"
+  if have ufw && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    ufw allow 80/tcp >/dev/null 2>&1 && HTTP80_OPENED="ufw"
+  elif have iptables && iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)'; then
+    iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 && HTTP80_OPENED="iptables"
+  fi
+  [[ $HTTP80_OPENED != no ]] && log "Temporarily allowed tcp/80 for the ACME challenge (${HTTP80_OPENED})."
+  return 0
+}
+_http01_close() {
+  case "$HTTP80_OPENED" in
+    ufw)      ufw delete allow 80/tcp >/dev/null 2>&1 || true ;;
+    iptables) iptables -D INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true ;;
+  esac
+  HTTP80_OPENED="no"
+  return 0
+}
+
 obtain_letsencrypt() {
   local email_arg="--register-unsafely-without-email"
   [[ -n $LE_EMAIL ]] && email_arg="-m ${LE_EMAIL}"
   systemctl stop mihomo >/dev/null 2>&1 || true
+  _http01_open
+  local rc=0
   # $email_arg must stay unquoted: it has to split into "-m" + address.
-  if certbot certonly --standalone --non-interactive --agree-tos $email_arg \
-       --http-01-port 80 -d "$VPN_DOMAIN" >/dev/null 2>&1; then
+  certbot certonly --standalone --non-interactive --agree-tos $email_arg \
+       --http-01-port 80 -d "$VPN_DOMAIN" >/dev/null 2>&1 || rc=$?
+  _http01_close
+  if (( rc == 0 )); then
     install -d -m 0750 "$MH_CERT_DIR"
     # Part of the success condition: if certbot reported success but the live
     # directory is not readable, return 1 so setup_cert falls back to self-signed

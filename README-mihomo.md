@@ -105,10 +105,34 @@ sudo bash Mihomo_Deployment.sh --reality-sni www.microsoft.com --steal-sni www.a
 server cannot reach the decoy, the disguise fails open and looks anomalous — worse than not
 using it.
 
-The certificate itself is Let's Encrypt via certbot, falling back to self-signed. It is
-always **copied into `/etc/mihomo/cert/`** rather than referenced in `/etc/letsencrypt`,
-because mihomo's `SAFE_PATHS` check rejects any config file path outside its home directory.
-A certbot deploy hook re-copies it on renewal.
+### How the certificate is obtained
+
+The script asks for the domain first (`--domain`, required — there is no default and `-y`
+without it aborts), then:
+
+1. `certbot certonly --standalone --http-01-port 80 -d <domain>` — mihomo is stopped for the
+   request, though it never binds :80 itself, so renewals need no downtime.
+2. The issued pair is **copied into `/etc/mihomo/cert/`** rather than referenced in
+   `/etc/letsencrypt`, because mihomo's `SAFE_PATHS` check rejects any path outside its home
+   directory — a listener pointing at `/etc/letsencrypt/live/...` fails to bind, and does so
+   *non-fatally*, leaving the service `active` with a dead listener.
+3. A deploy hook is installed at `/etc/letsencrypt/renewal-hooks/deploy/mihomo-<domain>.sh`
+   that re-copies and reloads on every renewal.
+4. If issuance fails — DNS not pointing here, :80 taken, rate limit — it warns and falls back
+   to a self-signed certificate rather than leaving you with none.
+
+Pre-flight `dig`s the A record first and warns when it does not resolve to this host, since
+that is the usual reason HTTP-01 fails.
+
+`certbot`'s challenge needs inbound tcp/80, but the firewall step runs *after* the
+certificate step. On a host where ufw is already active that would silently break issuance,
+so :80 is opened for the duration of the request and closed again afterwards; the permanent
+rule is added later only if issuance actually succeeded.
+
+**Not every deployment needs a certificate at all.** `setup_cert` is skipped entirely when no
+selected protocol wants one — a `--protocols reality,jls,shadowtls,shadowquic` node deploys
+34 listeners with no certificate anywhere on disk and no `certificate:` key in the config
+(verified: 34/34 bind, zero errors).
 
 ---
 

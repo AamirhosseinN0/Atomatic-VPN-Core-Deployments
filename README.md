@@ -16,6 +16,12 @@ sudo bash iKev2_Deployment.sh
 > Ubuntu 22/24/26 (VLESS-Reality, Hysteria2, TUIC, Trojan, ShadowTLS, Shadowsocks-2022,
 > AnyTLS, NaiveProxy, VMess, and Snell v5/v6), with generated share links,
 > subscription, sing-box and Clash configs. See [README-singbox.md](README-singbox.md).
+>
+> **And:** [`Xray_Deployment.sh`](Xray_Deployment.sh) — the same idea for
+> [**Xray-core**](https://xtls.github.io) (VLESS-Reality/Vision, VLESS-XHTTP,
+> post-quantum VLESS Encryption, Trojan, VMess, Hysteria2, Shadowsocks-2022),
+> including Xray's fallbacks mode that serves several protocols on one TLS port.
+> See [README-xray.md](README-xray.md).
 
 ---
 

@@ -17,10 +17,12 @@
 !README.md
 !README-singbox.md
 !README-xray.md
+!README-mihomo.md
 !LICENSE
 !iKev2_Deployment.sh
 !Singbox_Deployment.sh
 !Xray_Deployment.sh
+!Mihomo_Deployment.sh
 
 # ----------------------------------------------------------------------------
 #  Second layer. These stay meaningful if the deny-by-default block above is

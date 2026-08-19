@@ -140,7 +140,7 @@ Written to `/root/mihomo-clients/`:
 
 | File | For |
 |---|---|
-| `client-mihomo.yaml` | mihomo / Clash.Meta — **every** node; the complete bundle |
+| `client-mihomo.yaml` | mihomo / Clash.Meta — **all 73 proxy nodes**; the complete bundle |
 | `links.txt` | share links, portable subset only |
 | `subscription.txt` | base64 of `links.txt` (v2rayN, NekoBox, Streisand, Shadowrocket) |
 | `client-singbox.json` | sing-box client config, compatible subset |
@@ -149,8 +149,25 @@ Written to `/root/mihomo-clients/`:
 **Only 24 of the 74 nodes have a share-link form**, and that is not a shortcut — no URI
 grammar exists in any client for Snell, ShadowQUIC, Sudoku, Mieru, TrustTunnel, the
 mKCP/Mekya/TLS-mirror transports, or any ShadowTLS / RestLS / JLS wrapper. Emitting a link
-for those would produce something no client can import. They live in the YAML, and
-`README.txt` says which is which per node.
+for those would produce something no client can import. They all live in the YAML instead.
+
+`README.txt` carries a per-node matrix — `yaml` / `link` / `sing-box` / `port` — with a
+totals row, so it is always explicit which artefact carries which node:
+
+```
+  key                          l4     yaml   link   sing-box  port
+  vless-tcp-tls                tcp    yes    yes    yes       40000
+  ...
+  hysteria2-realm              tcp    no     no     no        40065
+  TOTAL 74                            73     24     20
+```
+
+**73 of the 74, not all 74.** The YAML holds every node you can actually dial. The one
+exception is `hysteria2-realm`, which is not a proxy at all: it is the HTTPS rendezvous
+endpoint that Hysteria2 nodes register with through `realm-opts`, so there is no `proxies:`
+entry it could have. It is deployed and listening, but nothing in the generated config
+points at it — wire it up by hand if you want realm mode, or leave it out with
+`--protocols` to save the port.
 
 `--serve-sub` additionally serves the bundle over plain HTTP at a secret path, picking the
 right artefact from the client's `User-Agent`.

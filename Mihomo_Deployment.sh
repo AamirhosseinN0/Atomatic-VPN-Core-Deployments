@@ -13,7 +13,7 @@
 #  secret, writes a schema-correct config.yaml, validates it with `mihomo -t`
 #  BEFORE restarting, tunes the kernel for TCP + QUIC, opens the firewall and
 #  emits ready-to-import client bundles:
-#     * a mihomo / Clash.Meta client YAML  — understands EVERY node here
+#     * a mihomo / Clash.Meta client YAML  — every proxy node in one file
 #     * share links + base64 subscription  — the subset that has a URI form
 #     * a sing-box client config.json      — the subset sing-box can do
 #
@@ -2417,24 +2417,36 @@ write_readme() {
     echo "listeners: $(selected_count)"
     echo
     echo "Files:"
-    echo "  client-mihomo.yaml  mihomo / Clash.Meta config — EVERY node, the complete bundle"
+    echo "  client-mihomo.yaml  mihomo / Clash.Meta config — every PROXY node (see 'yaml' below)"
     echo "  links.txt           one share link per line (the portable subset only)"
     echo "  subscription.txt    base64 of links.txt (v2rayN, NekoBox, Streisand, Shadowrocket)"
     echo "  client-singbox.json sing-box client config (compatible subset — see below)"
     echo
     echo "Which artefact carries which node:"
-    printf '  %-28s %-8s %-6s %-8s %s\n' "key" "l4" "link" "sing-box" "port"
+    printf '  %-28s %-6s %-6s %-6s %-9s %s\n' "key" "l4" "yaml" "link" "sing-box" "port"
+    local _y _n_yaml=0 _n_link=0 _n_sb=0
     for key in $SELECTED; do
-      printf '  %-28s %-8s %-6s %-8s %s\n' "$key" "$(proto_l4 "$key")" \
+      # mihomo_of returns non-zero for anything that is not a client-dialable
+      # proxy — today that is only the hysteria2 realm rendezvous server.
+      if mihomo_of "$key" >/dev/null 2>&1; then _y=yes; _n_yaml=$((_n_yaml+1)); else _y=no; fi
+      has_link "$key" && _n_link=$((_n_link+1))
+      singbox_capable "$key" && _n_sb=$((_n_sb+1))
+      printf '  %-28s %-6s %-6s %-6s %-9s %s\n' "$key" "$(proto_l4 "$key")" "$_y" \
         "$(has_link "$key" && echo yes || echo no)" \
         "$(singbox_capable "$key" && echo yes || echo no)" \
         "${PORT[$key]}"
     done
+    printf '  %-28s %-6s %-6s %-6s %-9s\n' "TOTAL $(selected_count)" "" "$_n_yaml" "$_n_link" "$_n_sb"
     echo
     echo "Client limitations (upstream implementations, verified Aug 2026):"
     echo "  * mihomo is the ONLY client that speaks every node here. Anything marked"
     echo "    'link: no' exists only in client-mihomo.yaml — there is no URI grammar"
     echo "    for it in any client, so emitting one would be a link nothing can import."
+    echo "  * 'yaml: no' means the listener is not a client-dialable proxy at all."
+    echo "    hysteria2-realm is the only such entry: it is the HTTPS rendezvous"
+    echo "    endpoint that hysteria2 nodes register with through realm-opts, so it"
+    echo "    has no proxies: entry of its own. It is deployed but nothing in the"
+    echo "    generated config points at it — wire it up by hand if you want realm mode."
     echo "  * No share link exists for: Snell, ShadowQUIC, Sudoku, Mieru, TrustTunnel,"
     echo "    mKCP/Mekya/TLS-mirror transports, and every ShadowTLS / RestLS / JLS"
     echo "    wrapper. mihomo's own URI parser has no parameters for them."
@@ -2623,7 +2635,12 @@ BANNER
   (( n > 24 )) && printf '    %s... and %d more — full map in %s/README.txt%s\n' "$C_D" "$((n-24))" "$CLIENT_OUT_DIR" "$C_RST"
   hr
   printf '  %sClient bundles%s\n' "$C_BOLD" "$C_RST"
-  printf '    %-38s %s\n' "${CLIENT_OUT_DIR}/client-mihomo.yaml" "<- every node lives here"
+  # Count what actually landed in the YAML rather than assuming it equals the
+  # listener count: a listener that is not a client-dialable proxy (the realm
+  # rendezvous server) is deployed but has no proxies: entry.
+  local _yaml=0
+  for key in $SELECTED; do mihomo_of "$key" >/dev/null 2>&1 && _yaml=$((_yaml+1)); done
+  printf '    %-38s %s\n' "${CLIENT_OUT_DIR}/client-mihomo.yaml" "<- all ${_yaml} proxy nodes"
   printf '    %s\n' "${CLIENT_OUT_DIR}/links.txt"
   printf '    %s\n' "${CLIENT_OUT_DIR}/subscription.txt"
   printf '    %s\n' "${CLIENT_OUT_DIR}/client-singbox.json"

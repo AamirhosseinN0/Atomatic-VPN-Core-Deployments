@@ -1,0 +1,542 @@
+# =============================================================================
+#  README fresh-setup test
+#
+#  Loop harness for onboarding-docs verification: each job picks a fresh
+#  GitHub-hosted Ubuntu runner (a clean VM with sudo — the closest automated
+#  stand-in for the "fresh Ubuntu server" the READMEs target) and runs the
+#  README's own documented unattended command, then verifies only the
+#  outcomes the READMEs explicitly promise:
+#
+#    - the deployer exits 0 on a fresh machine
+#    - the service is active
+#    - the management CLI (ikev2ctl / singboxctl / xrayctl / mihomoctl) works
+#    - the client bundle exists with every promised file
+#    - the kernel-tuning sysctl drop-in was written
+#
+#  Runner-only adaptations (documented inline per job):
+#    - --domain vpn.example.com — the READMEs' own placeholder; runners have
+#      no DNS, so certificate protocols use --cert-mode self (a documented
+#      mode) instead of Let's Encrypt
+#    - Let's Encrypt issuance is not exercised: no inbound port 80
+#
+#  Each job publishes a redacted markdown report to the `readme-test-results`
+#  branch under reports/<run_id>/ so results are readable without logging in.
+# =============================================================================
+
+name: README fresh-setup test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'README*.md'
+      - '*.sh'
+      - '.github/workflows/readme-setup-test.yml'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TEST_DOMAIN: vpn.example.com
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # iKev2 — README-ikev2.md's exact "Fully unattended" example
+  # (cert-mode self is that script's documented default)
+  # ---------------------------------------------------------------------------
+  ikev2:
+    name: "iKev2 / ubuntu-22.04"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CLI: /usr/local/sbin/ikev2ctl
+      SERVICE: strongswan-swanctl
+      CLIENTS_DIR: /root/ikev2-clients
+      SYSCTL_FILE: /etc/sysctl.d/99-ikev2-vpn.conf
+      BUNDLE_FILES: >-
+        /root/ikev2-clients/client1/client1-windows.p12
+        /root/ikev2-clients/client1/client1-android-cert.sswan
+        /root/ikev2-clients/client1/client1-windows-userpass.ps1
+        /root/ikev2-clients/client1/README.txt
+        /root/ikev2-clients/client1.zip
+      EXTRA_CHECK_NAME: "charon binds UDP 500 and 4500 (README troubleshooting section)"
+      EXTRA_CHECK_CMD: "ss -lun | grep -qE ':500 |:4500 '"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fresh setup — README-ikev2.md unattended command
+        run: |
+          set -euo pipefail
+          RUNNER_IP="$(curl -sf --max-time 10 https://api.ipify.org || hostname -I | awk '{print $1}')"
+          echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
+          echo "DEPLOY_CMD=sudo bash iKev2_Deployment.sh -y --domain ${TEST_DOMAIN} --ip ${RUNNER_IP}" >> "$GITHUB_ENV"
+          sudo bash iKev2_Deployment.sh -y --domain "$TEST_DOMAIN" --ip "$RUNNER_IP" 2>&1 | tee deploy.log
+          touch deploy.ok
+
+      - name: Verify README promises
+        if: always()
+        run: bash .github/scripts/verify-deploy.sh
+
+      - name: Assemble job report
+        if: always()
+        run: |
+          set -u
+          mkdir -p report
+          {
+            echo "# ikev2 (ubuntu-22.04) — run ${{ github.run_id }}"
+            echo
+            echo "- commit: [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "- image: ${ImageOS:-unknown} / $(uname -rm)"
+            echo "- deploy command: \`${DEPLOY_CMD:-<not recorded>}\`"
+            echo "- deploy status: $(if [[ -f deploy.ok ]]; then echo OK; else echo FAILED; fi)"
+            echo
+            echo "## Verification"
+            echo '```'
+            cat verify.log 2>/dev/null || echo "(verify step did not run)"
+            echo '```'
+            echo
+            echo "## Deploy log (last 120 lines)"
+            echo '```'
+            tail -n 120 deploy.log 2>/dev/null || echo "(no deploy.log)"
+            echo '```'
+            echo
+            echo "## Service status"
+            echo '```'
+            sudo systemctl status "$SERVICE" --no-pager -l 2>&1 | head -n 30 || true
+            echo '```'
+            echo
+            echo "## Service journal (last 60 lines)"
+            echo '```'
+            sudo journalctl -u "$SERVICE" --no-pager -n 60 2>&1 || true
+            echo '```'
+            echo
+            echo "## Client bundle listing"
+            echo '```'
+            sudo ls -laR "$CLIENTS_DIR" 2>&1 | head -n 80 || true
+            echo '```'
+            echo
+            echo "## sysctl drop-in (first 20 lines)"
+            echo '```'
+            sudo head -n 20 "$SYSCTL_FILE" 2>&1 || true
+            echo '```'
+          } | sed -E \
+              -e 's#((vless|vmess|trojan|hy2|hysteria2|tuic|anytls|ss|snell|socks|naive)://)[^[:space:]]+#\1<redacted>#g' \
+              -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<uuid>/g' \
+              -e 's/[A-Za-z0-9+/=]{40,}/<redacted-blob>/g' \
+              -e 's/(password|passwd|psk|secret|token|uuid|private)[=: ][^[:space:]]+/\1=<redacted>/Ig' \
+              > report/ikev2.md
+          {
+            if [[ -f deploy.ok ]]; then echo "deploy: OK"; else echo "deploy: FAILED"; fi
+            if [[ -f verify.log ]]; then
+              echo "verify: $(grep -c '^PASS:' verify.log || true) passed, $(grep -c '^FAIL:' verify.log || true) failed"
+            else
+              echo "verify: not run"
+            fi
+          } > report/status
+          cp deploy.log report/ 2>/dev/null || true
+          cp verify.log report/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-ikev2
+          path: report/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Singbox — the main README's "one-step run" pipe form, run against the
+  # exact commit under test (SHA-pinned raw URL), with README-singbox.md's
+  # unattended flags adapted to --cert-mode self (documented mode) because a
+  # runner has no DNS / inbound port 80 for Let's Encrypt.
+  # ---------------------------------------------------------------------------
+  singbox:
+    name: "Singbox / ubuntu-24.04"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CLI: /usr/local/sbin/singboxctl
+      SERVICE: sing-box
+      CLIENTS_DIR: /root/singbox-clients
+      SYSCTL_FILE: /etc/sysctl.d/99-singbox.conf
+      BUNDLE_FILES: >-
+        /root/singbox-clients/links.txt
+        /root/singbox-clients/subscription.txt
+        /root/singbox-clients/client-singbox.json
+        /root/singbox-clients/client-clash.yaml
+        /root/singbox-clients/README.txt
+      JSON_GLOB: "/root/singbox-clients/client-*.json"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fresh setup — README one-step pipe command
+        run: |
+          set -euo pipefail
+          RAW="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/Singbox_Deployment.sh"
+          LOCAL_SHA="$(sha256sum Singbox_Deployment.sh | cut -d' ' -f1)"
+          RAW_SHA=""
+          for _ in $(seq 1 18); do
+            RAW_SHA="$(curl -sfL --max-time 30 "$RAW" | sha256sum | cut -d' ' -f1 || true)"
+            [[ "$RAW_SHA" == "$LOCAL_SHA" ]] && break
+            echo "raw.githubusercontent.com is not serving this commit yet; retrying..."
+            sleep 10
+          done
+          if [[ "$RAW_SHA" != "$LOCAL_SHA" ]]; then
+            echo "::error::raw URL did not serve commit ${GITHUB_SHA} within 3 minutes"
+            exit 1
+          fi
+          echo "DEPLOY_CMD=wget -qO- ${RAW} | sudo bash -s -- -y --domain ${TEST_DOMAIN} --protocols all --cert-mode self" >> "$GITHUB_ENV"
+          wget -qO- "$RAW" | sudo bash -s -- -y --domain "$TEST_DOMAIN" --protocols all --cert-mode self 2>&1 | tee deploy.log
+          touch deploy.ok
+
+      - name: Verify README promises
+        if: always()
+        run: bash .github/scripts/verify-deploy.sh
+
+      - name: Assemble job report
+        if: always()
+        run: |
+          set -u
+          mkdir -p report
+          {
+            echo "# singbox (ubuntu-24.04) — run ${{ github.run_id }}"
+            echo
+            echo "- commit: [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "- image: ${ImageOS:-unknown} / $(uname -rm)"
+            echo "- deploy command: \`${DEPLOY_CMD:-<not recorded>}\`"
+            echo "- deploy status: $(if [[ -f deploy.ok ]]; then echo OK; else echo FAILED; fi)"
+            echo
+            echo "## Verification"
+            echo '```'
+            cat verify.log 2>/dev/null || echo "(verify step did not run)"
+            echo '```'
+            echo
+            echo "## Deploy log (last 120 lines)"
+            echo '```'
+            tail -n 120 deploy.log 2>/dev/null || echo "(no deploy.log)"
+            echo '```'
+            echo
+            echo "## Service status"
+            echo '```'
+            sudo systemctl status "$SERVICE" --no-pager -l 2>&1 | head -n 30 || true
+            echo '```'
+            echo
+            echo "## Service journal (last 60 lines)"
+            echo '```'
+            sudo journalctl -u "$SERVICE" --no-pager -n 60 2>&1 || true
+            echo '```'
+            echo
+            echo "## Client bundle listing"
+            echo '```'
+            sudo ls -laR "$CLIENTS_DIR" 2>&1 | head -n 80 || true
+            echo '```'
+            echo
+            echo "## sysctl drop-in (first 20 lines)"
+            echo '```'
+            sudo head -n 20 "$SYSCTL_FILE" 2>&1 || true
+            echo '```'
+          } | sed -E \
+              -e 's#((vless|vmess|trojan|hy2|hysteria2|tuic|anytls|ss|snell|socks|naive)://)[^[:space:]]+#\1<redacted>#g' \
+              -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<uuid>/g' \
+              -e 's/[A-Za-z0-9+/=]{40,}/<redacted-blob>/g' \
+              -e 's/(password|passwd|psk|secret|token|uuid|private)[=: ][^[:space:]]+/\1=<redacted>/Ig' \
+              > report/singbox.md
+          {
+            if [[ -f deploy.ok ]]; then echo "deploy: OK"; else echo "deploy: FAILED"; fi
+            if [[ -f verify.log ]]; then
+              echo "verify: $(grep -c '^PASS:' verify.log || true) passed, $(grep -c '^FAIL:' verify.log || true) failed"
+            else
+              echo "verify: not run"
+            fi
+          } > report/status
+          cp deploy.log report/ 2>/dev/null || true
+          cp verify.log report/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-singbox
+          path: report/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Xray — README-xray.md's exact "Fully unattended" example (the
+  # certificate-less protocol subset, so no runner adaptation is needed)
+  # ---------------------------------------------------------------------------
+  xray:
+    name: "Xray / ubuntu-24.04"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CLI: /usr/local/sbin/xrayctl
+      SERVICE: xray
+      CLIENTS_DIR: /root/xray-clients
+      SYSCTL_FILE: /etc/sysctl.d/99-xray.conf
+      BUNDLE_FILES: >-
+        /root/xray-clients/links.txt
+        /root/xray-clients/subscription.txt
+        /root/xray-clients/client-xray.json
+        /root/xray-clients/client-singbox.json
+        /root/xray-clients/client-clash.yaml
+      JSON_GLOB: "/root/xray-clients/client-*.json"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fresh setup — README-xray.md unattended command
+        run: |
+          set -euo pipefail
+          echo "DEPLOY_CMD=sudo bash Xray_Deployment.sh -y --domain ${TEST_DOMAIN} --protocols vless-reality,hysteria2,ss2022" >> "$GITHUB_ENV"
+          sudo bash Xray_Deployment.sh -y --domain "$TEST_DOMAIN" --protocols vless-reality,hysteria2,ss2022 2>&1 | tee deploy.log
+          touch deploy.ok
+
+      - name: Verify README promises
+        if: always()
+        run: bash .github/scripts/verify-deploy.sh
+
+      - name: Assemble job report
+        if: always()
+        run: |
+          set -u
+          mkdir -p report
+          {
+            echo "# xray (ubuntu-24.04) — run ${{ github.run_id }}"
+            echo
+            echo "- commit: [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "- image: ${ImageOS:-unknown} / $(uname -rm)"
+            echo "- deploy command: \`${DEPLOY_CMD:-<not recorded>}\`"
+            echo "- deploy status: $(if [[ -f deploy.ok ]]; then echo OK; else echo FAILED; fi)"
+            echo
+            echo "## Verification"
+            echo '```'
+            cat verify.log 2>/dev/null || echo "(verify step did not run)"
+            echo '```'
+            echo
+            echo "## Deploy log (last 120 lines)"
+            echo '```'
+            tail -n 120 deploy.log 2>/dev/null || echo "(no deploy.log)"
+            echo '```'
+            echo
+            echo "## Service status"
+            echo '```'
+            sudo systemctl status "$SERVICE" --no-pager -l 2>&1 | head -n 30 || true
+            echo '```'
+            echo
+            echo "## Service journal (last 60 lines)"
+            echo '```'
+            sudo journalctl -u "$SERVICE" --no-pager -n 60 2>&1 || true
+            echo '```'
+            echo
+            echo "## Client bundle listing"
+            echo '```'
+            sudo ls -laR "$CLIENTS_DIR" 2>&1 | head -n 80 || true
+            echo '```'
+            echo
+            echo "## sysctl drop-in (first 20 lines)"
+            echo '```'
+            sudo head -n 20 "$SYSCTL_FILE" 2>&1 || true
+            echo '```'
+          } | sed -E \
+              -e 's#((vless|vmess|trojan|hy2|hysteria2|tuic|anytls|ss|snell|socks|naive)://)[^[:space:]]+#\1<redacted>#g' \
+              -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<uuid>/g' \
+              -e 's/[A-Za-z0-9+/=]{40,}/<redacted-blob>/g' \
+              -e 's/(password|passwd|psk|secret|token|uuid|private)[=: ][^[:space:]]+/\1=<redacted>/Ig' \
+              > report/xray.md
+          {
+            if [[ -f deploy.ok ]]; then echo "deploy: OK"; else echo "deploy: FAILED"; fi
+            if [[ -f verify.log ]]; then
+              echo "verify: $(grep -c '^PASS:' verify.log || true) passed, $(grep -c '^FAIL:' verify.log || true) failed"
+            else
+              echo "verify: not run"
+            fi
+          } > report/status
+          cp deploy.log report/ 2>/dev/null || true
+          cp verify.log report/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-xray
+          path: report/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Mihomo — README-mihomo.md's documented `recommended` preset (the README's
+  # own suggested choice for a production node; certificate-less techniques
+  # are covered, self-signed handles the rest)
+  # ---------------------------------------------------------------------------
+  mihomo:
+    name: "Mihomo / ubuntu-24.04"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CLI: /usr/local/sbin/mihomoctl
+      SERVICE: mihomo
+      CLIENTS_DIR: /root/mihomo-clients
+      SYSCTL_FILE: /etc/sysctl.d/99-mihomo.conf
+      BUNDLE_FILES: >-
+        /root/mihomo-clients/links.txt
+        /root/mihomo-clients/subscription.txt
+        /root/mihomo-clients/client-mihomo.yaml
+        /root/mihomo-clients/client-singbox.json
+        /root/mihomo-clients/README.txt
+      JSON_GLOB: "/root/mihomo-clients/client-*.json"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fresh setup — README-mihomo.md unattended command
+        run: |
+          set -euo pipefail
+          echo "DEPLOY_CMD=sudo bash Mihomo_Deployment.sh -y --domain ${TEST_DOMAIN} --protocols recommended" >> "$GITHUB_ENV"
+          sudo bash Mihomo_Deployment.sh -y --domain "$TEST_DOMAIN" --protocols recommended 2>&1 | tee deploy.log
+          touch deploy.ok
+
+      - name: Verify README promises
+        if: always()
+        run: bash .github/scripts/verify-deploy.sh
+
+      - name: Assemble job report
+        if: always()
+        run: |
+          set -u
+          mkdir -p report
+          {
+            echo "# mihomo (ubuntu-24.04) — run ${{ github.run_id }}"
+            echo
+            echo "- commit: [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "- image: ${ImageOS:-unknown} / $(uname -rm)"
+            echo "- deploy command: \`${DEPLOY_CMD:-<not recorded>}\`"
+            echo "- deploy status: $(if [[ -f deploy.ok ]]; then echo OK; else echo FAILED; fi)"
+            echo
+            echo "## Verification"
+            echo '```'
+            cat verify.log 2>/dev/null || echo "(verify step did not run)"
+            echo '```'
+            echo
+            echo "## Deploy log (last 120 lines)"
+            echo '```'
+            tail -n 120 deploy.log 2>/dev/null || echo "(no deploy.log)"
+            echo '```'
+            echo
+            echo "## Service status"
+            echo '```'
+            sudo systemctl status "$SERVICE" --no-pager -l 2>&1 | head -n 30 || true
+            echo '```'
+            echo
+            echo "## Service journal (last 60 lines)"
+            echo '```'
+            sudo journalctl -u "$SERVICE" --no-pager -n 60 2>&1 || true
+            echo '```'
+            echo
+            echo "## Client bundle listing"
+            echo '```'
+            sudo ls -laR "$CLIENTS_DIR" 2>&1 | head -n 80 || true
+            echo '```'
+            echo
+            echo "## sysctl drop-in (first 20 lines)"
+            echo '```'
+            sudo head -n 20 "$SYSCTL_FILE" 2>&1 || true
+            echo '```'
+          } | sed -E \
+              -e 's#((vless|vmess|trojan|hy2|hysteria2|tuic|anytls|ss|snell|socks|naive)://)[^[:space:]]+#\1<redacted>#g' \
+              -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<uuid>/g' \
+              -e 's/[A-Za-z0-9+/=]{40,}/<redacted-blob>/g' \
+              -e 's/(password|passwd|psk|secret|token|uuid|private)[=: ][^[:space:]]+/\1=<redacted>/Ig' \
+              > report/mihomo.md
+          {
+            if [[ -f deploy.ok ]]; then echo "deploy: OK"; else echo "deploy: FAILED"; fi
+            if [[ -f verify.log ]]; then
+              echo "verify: $(grep -c '^PASS:' verify.log || true) passed, $(grep -c '^FAIL:' verify.log || true) failed"
+            else
+              echo "verify: not run"
+            fi
+          } > report/status
+          cp deploy.log report/ 2>/dev/null || true
+          cp verify.log report/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-mihomo
+          path: report/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Report — assemble an index from the job artifacts and publish the
+  # redacted reports to the readme-test-results branch, where they can be
+  # fetched without authentication.
+  # ---------------------------------------------------------------------------
+  report:
+    name: "Publish test report"
+    needs: [ikev2, singbox, xray, mihomo]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Index and push to readme-test-results branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID='${{ github.run_id }}'
+          BRANCH=readme-test-results
+          DEST="reports/${RUN_ID}"
+          mkdir -p "$DEST"
+          for d in artifacts/report-*/; do
+            [[ -d "$d" ]] || continue
+            job="$(basename "$d" | sed 's/^report-//')"
+            cp "$d"/*.md "$DEST/" 2>/dev/null || true
+            cp "$d/status" "$DEST/${job}.status" 2>/dev/null || true
+          done
+          {
+            echo "# Fresh-setup test — run ${RUN_ID}"
+            echo
+            echo "- commit: [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "- event: ${{ github.event_name }}"
+            echo
+            echo "| job | result |"
+            echo "|---|---|"
+            for d in artifacts/report-*/; do
+              [[ -d "$d" ]] || continue
+              job="$(basename "$d" | sed 's/^report-//')"
+              st="$(tr '\n' ' ' < "$d/status" 2>/dev/null || true)"
+              echo "| [${job}](${job}.md) | ${st:-no report produced} |"
+            done
+          } > "$DEST/index.md"
+
+          WORK="$RUNNER_TEMP/reportrepo"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          cd "$WORK"
+          git init -q
+          git config user.name  "readme-setup-test"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q origin "$BRANCH" || true
+          if git show-ref --verify --quiet "refs/remotes/origin/${BRANCH}"; then
+            git checkout -q -B "$BRANCH" "origin/${BRANCH}"
+          else
+            git checkout -q -b "$BRANCH"
+          fi
+          mkdir -p "$WORK/$DEST"
+          cp "${GITHUB_WORKSPACE}/${DEST}"/* "$WORK/$DEST"/
+          git add -A
+          git commit -qm "run ${RUN_ID} — ${GITHUB_SHA}"
+          for _ in 1 2 3 4 5; do
+            if git push -q origin "$BRANCH"; then
+              echo "report published to ${BRANCH}/${DEST}/"
+              exit 0
+            fi
+            git fetch -q origin "$BRANCH"
+            git rebase -q "origin/${BRANCH}" || { git rebase --abort || true; }
+            sleep 5
+          done
+          echo "::warning::could not push the report branch"

@@ -14,6 +14,11 @@
 
 !.gitignore
 !.gitattributes
+!.github/
+!.github/workflows/
+!.github/workflows/readme-setup-test.yml
+!.github/scripts/
+!.github/scripts/verify-deploy.sh
 !README.md
 !README-ikev2.md
 !README-singbox.md

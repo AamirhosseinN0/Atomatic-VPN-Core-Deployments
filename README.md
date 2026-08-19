@@ -1,187 +1,144 @@
-# iKev2_Deployment
+# Atomatic VPN Core Deployments
 
-One self-contained Bash script that turns a fresh **Ubuntu 22.04** server into a working
-**IKEv2/IPsec VPN** for **Windows 10/11** and **Android**, with both
-**username + password (EAP-MSCHAPv2)** and **certificate** authentication.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-E95420?logo=ubuntu&logoColor=white)
+![Bash](https://img.shields.io/badge/Bash-one--file%20deployers-4EAA25?logo=gnu-bash&logoColor=white)
 
-It also generates ready-to-use client bundles: an importable `.p12`, an Android
-`.sswan` profile, and a PowerShell installer that configures Windows for you.
+Four self-contained Bash scripts, each of which turns a fresh **Ubuntu** server into a
+working VPN or proxy node in one run. You pick the protocols; the script generates every
+secret, requests the certificate, validates the config, tunes the kernel, opens the
+firewall, and hands you ready-to-import client bundles.
+
+No Ansible, no Docker, no clone needed — `wget` one file and run it.
+
+---
+
+## One-step run
+
+On a fresh Ubuntu server — each command downloads and runs one deployer. The scripts
+ask their questions on the terminal, not the pipe, so these stay fully interactive:
 
 ```bash
-sudo bash iKev2_Deployment.sh
+# IKEv2/IPsec VPN gateway for Windows + Android (strongSwan)
+wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/iKev2_Deployment.sh | sudo bash
+
+# sing-box proxy node
+wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Singbox_Deployment.sh | sudo bash
+
+# Xray-core proxy node
+wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Xray_Deployment.sh | sudo bash
+
+# mihomo (Clash.Meta) proxy node
+wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Mihomo_Deployment.sh | sudo bash
 ```
 
-> **Also in this repo:** [`Singbox_Deployment.sh`](Singbox_Deployment.sh) — a
-> multi-protocol [**sing-box**](https://sing-box.sagernet.org) proxy deployer for
-> Ubuntu 22/24/26 (VLESS-Reality, Hysteria2, TUIC, Trojan, ShadowTLS, Shadowsocks-2022,
-> AnyTLS, NaiveProxy, VMess, and Snell v5/v6), with generated share links,
-> subscription, sing-box and Clash configs. See [README-singbox.md](README-singbox.md).
->
-> **And:** [`Xray_Deployment.sh`](Xray_Deployment.sh) — the same idea for
-> [**Xray-core**](https://xtls.github.io) (VLESS-Reality/Vision, VLESS-XHTTP,
-> post-quantum VLESS Encryption, Trojan, VMess, Hysteria2, Shadowsocks-2022),
-> including Xray's fallbacks mode that serves several protocols on one TLS port.
-> See [README-xray.md](README-xray.md).
+Flags pass straight through for unattended runs:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Singbox_Deployment.sh | sudo bash -s -- -y --domain vpn.example.com
+```
 
 ---
 
-## Why another IKEv2 script
+## The four deployers
 
-Most IKEv2 setups fail on Windows for reasons that are easy to get wrong and hard to
-diagnose from the client's generic error codes. This script encodes the fixes:
-
-| Constraint | What breaks without it | Handled by |
+| Script | Turns a fresh Ubuntu server into… | Docs |
 |---|---|---|
-| Stock Windows ESP offers **SHA-1 only** (`aes256/aes128/3des/des/null`) | Tunnel negotiates then dies | `aes256-sha1` kept in `esp_proposals` |
-| Stock Windows IKE DH is **modp1024**; a server-initiated rekey needs modp2048 listed first | Drops after ~4 h | `modp2048` heads the proposal list |
-| An ESP proposal carrying a DH group the client never configured | Error **13816** | Non-PFS proposals ordered first |
-| Server cert needs EKU `serverAuth` **+** `1.3.6.1.5.5.8.2.2`, and the IP must be a **`DNS:`** SAN | Error **13801** | SAN = `DNS:<domain>, DNS:<ip>, IP:<ip>` |
-| Windows **cannot import PBES2/AES-256 PKCS#12** — OpenSSL 3's default | `.p12` import silently rejected | Built with `PBE-SHA1-3DES` + SHA-1 MAC, then verified |
-| OpenSSL 3 on Jammy moved **MD4** to the legacy provider | EAP-MSCHAPv2 fails; password login impossible | Legacy provider scoped to strongSwan via a systemd drop-in |
-| NATed Windows rejects a gateway-initiated CHILD_SA rekey | Error **12345** | `rekey_time = 0` on the children |
-| `strongswan.service` is an **alias for the legacy starter** on Jammy | Wrong daemon restarted; drop-in lands in the wrong directory | Unit chosen by which one runs `charon-systemd` |
+| [`iKev2_Deployment.sh`](iKev2_Deployment.sh) | an **IKEv2/IPsec VPN gateway** (strongSwan) for Windows 10/11 and Android, with username/password **and** certificate auth | [README-ikev2.md](README-ikev2.md) |
+| [`Singbox_Deployment.sh`](Singbox_Deployment.sh) | a **[sing-box](https://sing-box.sagernet.org)** proxy node — VLESS-Reality, Hysteria2, TUIC, Trojan, AnyTLS, ShadowTLS, Shadowsocks-2022, NaiveProxy, VMess, Snell v5/v6 | [README-singbox.md](README-singbox.md) |
+| [`Xray_Deployment.sh`](Xray_Deployment.sh) | an **[Xray-core](https://xtls.github.io)** proxy node — VLESS-Reality/Vision, XHTTP, post-quantum VLESS Encryption, Trojan, VMess, Hysteria2, SS-2022, and a fallbacks mode hiding several protocols behind one HTTPS port | [README-xray.md](README-xray.md) |
+| [`Mihomo_Deployment.sh`](Mihomo_Deployment.sh) | a **[mihomo](https://github.com/MetaCubeX/mihomo) (Clash.Meta)** node — 74 protocol × transport × camouflage combinations, including ShadowQUIC, Mieru, Sudoku, TrustTunnel, JLS/RestLS, mKCP/Mekya and Snell v1–v4 | [README-mihomo.md](README-mihomo.md) |
+
+### Which one do I want?
+
+- **A VPN your devices connect to natively** (built-in Windows / Android clients) →
+  `iKev2_Deployment.sh`
+- **A proxy node for v2rayN / Clash / sing-box clients** → `Singbox_Deployment.sh` for
+  the mainstream set, `Xray_Deployment.sh` for XHTTP / post-quantum VLESS / fallbacks,
+  `Mihomo_Deployment.sh` for every protocol the other two cores cannot do
 
 ---
 
-## Requirements
+## At a glance
 
-- Ubuntu 22.04 LTS, root access
-- A **KVM/Xen** VPS — containers (OpenVZ/LXC) usually lack the XFRM/IPsec kernel stack
-- A domain whose **A record points at the server**
-- UDP **500** and **4500** reachable
-
-> **Cloudflare users:** the A record must be **DNS only** (grey cloud). IKEv2 is UDP;
-> Cloudflare's proxy cannot carry it. The script detects proxied records and stops.
+| | iKev2 | Singbox | Xray | Mihomo |
+|---|---|---|---|---|
+| Ubuntu | 22.04 | 22.04 / 24.04 / 26.04 | 22.04 / 24.04 / 26.04 | 22.04 / 24.04 / 26.04 |
+| Runs on a container VPS (OpenVZ/LXC) | no — needs the kernel IPsec stack | yes | yes | yes |
+| Client bundles | `.p12`, `.sswan`, `.ps1` installers | links, subscription, sing-box + Clash configs | links, subscription, Xray + sing-box + Clash configs | links, subscription, mihomo + sing-box configs |
+| Management CLI | `ikev2ctl` | `singboxctl` | `xrayctl` | `mihomoctl` |
 
 ---
 
 ## Quick start
 
 ```bash
-wget https://raw.githubusercontent.com/<you>/iKev2_Deployment/main/iKev2_Deployment.sh
-sudo bash iKev2_Deployment.sh
+git clone https://github.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments.git
+cd Atomatic-VPN-Core-Deployments
+sudo bash Singbox_Deployment.sh        # or any of the four
 ```
 
-The script asks for everything it needs — domain and public IP are required, the rest
-have sensible defaults you can accept with ENTER. Afterwards it installs itself as
-`/usr/local/sbin/ikev2ctl`.
-
-Fully unattended:
+Or standalone — every script is a single file with no dependencies on the rest:
 
 ```bash
-sudo bash iKev2_Deployment.sh -y --domain vpn.example.com --ip 203.0.113.10
+wget https://raw.githubusercontent.com/AamirhosseinN0/Atomatic-VPN-Core-Deployments/main/Singbox_Deployment.sh
+sudo bash Singbox_Deployment.sh
 ```
 
----
-
-## Managing clients
+Interactive by default — every question has a sensible default you can accept with
+ENTER — or fully unattended:
 
 ```bash
-ikev2ctl add-client                 # interactive
-ikev2ctl add-client laptop --platform windows --auth both
-ikev2ctl list-clients               # users, certificates, bundles
-ikev2ctl revoke-client --name bob   # revokes the cert, regenerates the CRL
-ikev2ctl status                     # live IKE/CHILD SAs
-ikev2ctl check                      # re-run every health check
-ikev2ctl repair-md4                 # re-apply the EAP-MSCHAPv2 / MD4 fix
+sudo bash Singbox_Deployment.sh -y --domain vpn.example.com --protocols all --cert-mode letsencrypt
+sudo bash iKev2_Deployment.sh  -y --domain vpn.example.com --ip 203.0.113.10
 ```
 
-Each client bundle lands in `/root/ikev2-clients/<name>/` (plus a `.zip`) and contains:
-
-| File | For |
-|---|---|
-| `ca.crt` | Root CA to trust (self-signed mode only) |
-| `<name>-windows.p12` | Windows certificate login |
-| `<name>-windows-cert.ps1` | Installs CA + cert + VPN profile |
-| `<name>-windows-userpass.ps1` | Installs CA + username/password VPN profile |
-| `<name>-android-cert.sswan` | strongSwan app, certificate |
-| `<name>-android-userpass.sswan` | strongSwan app, username/password |
-| `README.txt` | Per-client instructions and credentials |
+Each README lists that script's full option set and unattended examples.
 
 ---
 
-## Options
+## What every deployer does
 
-| Option | Default | Notes |
-|---|---|---|
-| `--domain <fqdn>` | *required* | What clients type; goes into the cert SAN |
-| `--ip <ipv4>` | *required* | Public address; also added as a `DNS:` SAN |
-| `--cert-mode self\|letsencrypt` | `self` | Let's Encrypt means no CA to install on clients |
-| `--key-type rsa\|ecdsa` | `rsa` | Windows accepts RSA, P-256, P-384 only |
-| `--profile compat\|balanced\|strict` | `compat` | See below |
-| `--pool-eap <cidr>` | `10.20.10.0/24` | Username/password clients |
-| `--pool-cert-win <cidr>` | `10.20.11.0/24` | Windows certificate clients |
-| `--pool-cert-android <cidr>` | `10.20.12.0/24` | Android certificate clients |
-| `--dns <a,b>` | `1.1.1.1,8.8.8.8` | Pushed to clients |
-| `--ipv6 yes\|no` | `no` | Adds an IPv6 ULA pool |
-| `--firewall auto\|ufw\|iptables\|none` | `auto` | |
-| `--no-kernel-tuning` | tuning on | sysctl, BBR, conntrack, MSS clamp |
-
-### Crypto profiles
-
-| Profile | IKE | ESP | Windows setup |
-|---|---|---|---|
-| `compat` | includes modp1024 / 3DES for stock Windows | includes `aes256-sha1` | nothing to configure |
-| `balanced` | AES-256 + SHA-256, modp2048 / ECP384 | AES-256 + SHA-256 | run the generated `.ps1` |
-| `strict` | AES-256-GCM + ECP384 only | AES-256-GCM + ECP384 | **must** run the generated `.ps1` |
-
-`compat` is the default so the built-in Windows dialog works with zero client-side
-configuration. Choose `balanced` or `strict` if every client will run the `.ps1`.
+- **One self-contained file** — nothing to install beyond a stock Ubuntu system
+- **Secrets generated** — keys, UUIDs and passwords are created, never reused
+- **Certificates handled** — Let's Encrypt when a protocol wants TLS, automatic
+  self-signed fallback if issuance fails; REALITY / ShadowTLS / JLS-style camouflage
+  needs no certificate at all
+- **Ports found, not asked for** (proxy deployers) — every protocol gets a port that is
+  verified free, TCP and UDP tracked separately
+- **Config validated before the service restarts**, and a `check` command re-runs every
+  health check afterwards
+- **Kernel tuned** — BBR + `fq`, QUIC UDP buffers, conntrack sizing, written as a sysctl
+  drop-in (`--no-kernel-tuning` to skip); the IKEv2 script adds IP forwarding and MSS
+  clamping
+- **Firewall opened** for exactly the ports in use (`--firewall auto|ufw|iptables|none`)
+- **Client bundles written to `/root/*-clients/`** — share links, a base64 subscription
+  and per-core client configs; `--serve-sub` (proxy deployers) also serves them over HTTP
+- **A management CLI stays behind** — `ikev2ctl`, `singboxctl`, `xrayctl`, `mihomoctl` —
+  for status, health checks, updates and node management
 
 ---
 
-## Separate address pools
+## Requirements
 
-Clients are placed in different pools by how they authenticate, which strongSwan can
-distinguish reliably:
-
-- **EAP** (username/password, Windows + Android) → `pool-eap`
-- **Certificate, Android** → `pool-cert-android` (matched on `*@android.<domain>`, which
-  the `.sswan` pins via `local.id`)
-- **Certificate, anything else** → `pool-cert-win`
-
-This makes per-group firewall and routing rules straightforward.
-
----
-
-## Windows error codes
-
-| Code | Cause |
-|---|---|
-| **809** | NAT-T. Reboot after the `.ps1` sets `AssumeUDPEncapsulationContextOnSendRule = 2` |
-| **13801** | Server name typed doesn't match the certificate SAN, or the CA isn't in **Local Machine → Trusted Root** |
-| **13806** | CA certificate not imported at all |
-| **13868** / **789** | Crypto policy mismatch — re-run the `.ps1` for your profile |
-| **812** | Wrong username/password, or charon has no MD4 (`ikev2ctl repair-md4`) |
+- An Ubuntu server and root access
+- A **KVM/Xen** VPS for `iKev2_Deployment.sh` — containers usually lack the XFRM/IPsec
+  kernel stack. The three proxy deployers are userspace and run anywhere, containers
+  included
+- A domain whose **A record points at the server** whenever certificates are involved;
+  REALITY-based protocols work with no domain and no certificate
+- The scripts open their own firewall ports — nothing else to prepare
 
 ---
 
 ## Security notes
 
-- Client bundles under `/root/ikev2-clients/` contain **private keys and cleartext
+- Generated client bundles under `/root/*-clients/` contain **private keys and cleartext
   passwords**. Copy them over `scp`, then delete what you no longer need.
-- The `.sswan` profiles embed the PKCS#12 and, for the password profiles, the password
-  itself — treat them as secrets.
-- `compat` deliberately keeps 3DES and modp1024 reachable so the stock Windows dialog
-  works. If that is unacceptable for your threat model, use `balanced` or `strict`.
-- The OpenSSL legacy provider is enabled **only for the strongSwan unit** via a systemd
-  drop-in; system-wide TLS is untouched.
-- Revocation is real: `revoke-client` marks the certificate in the CA database,
-  regenerates the CRL and reloads it into charon.
-- Nothing in this repository contains server-specific values — the `.gitignore` also
-  blocks keys, bundles and state files from ever being committed.
-
----
-
-## Troubleshooting
-
-```bash
-ikev2ctl check                                  # every health check, with fixes
-journalctl -u strongswan-swanctl.service -f     # daemon log
-tail -f /var/log/strongswan.log                 # charon log
-swanctl --list-sas                              # live sessions
-ss -lunp | grep -E ':500|:4500'                 # is charon actually bound?
-```
+- Nothing server-specific is committed: the `.gitignore` is **deny-by-default**, so keys,
+  bundles and deployment state can never be committed by accident.
+- Each deployer's README carries its own security notes — service hardening, certificate
+  revocation, `--serve-sub` caveats.
 
 ---
 

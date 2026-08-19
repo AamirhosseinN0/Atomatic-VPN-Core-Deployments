@@ -15,6 +15,7 @@
 !.gitignore
 !.gitattributes
 !README.md
+!README-ikev2.md
 !README-singbox.md
 !README-xray.md
 !README-mihomo.md

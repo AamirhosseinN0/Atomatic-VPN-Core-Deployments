@@ -2385,13 +2385,40 @@ unified-delay: true
 tcp-concurrent: true
 find-process-mode: off
 external-controller: 127.0.0.1:9090
+EOF
+    # DNS is the one part of a client config that can break EVERY node at once,
+    # and it does so on exactly the networks this deployment exists for.
+    #
+    #  * `hosts:` pins this node's name to its address, so opening the tunnel
+    #    needs no DNS at all. Without it the client must resolve the domain
+    #    before it can dial anything, and if that lookup is blocked then all
+    #    ${#ALL_KEYS[@]} nodes fail identically — which reads like a dead server.
+    #  * The resolvers carry a '#PROXY' fragment, which mihomo parses as a proxy
+    #    name and sends that query THROUGH the tunnel (config.go parseNameServer).
+    #    So DoH being censored locally stops mattering once the tunnel is up.
+    #  * `proxy-server-nameserver` is the plain-UDP fallback used only to resolve
+    #    proxy hostnames, for the case where someone strips the hosts: entry.
+    if valid_ipv4 "$VPN_IP"; then
+      printf 'hosts:\n  %s: %s\n' "$VPN_DOMAIN" "$VPN_IP"
+    fi
+    cat <<'EOF'
 dns:
   enable: true
+  ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '+.lan'
+    - '+.local'
+  default-nameserver:
+    - 223.5.5.5
+    - 1.1.1.1
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 1.1.1.1
   nameserver:
-    - https://1.1.1.1/dns-query
-    - https://8.8.8.8/dns-query
+    - 'https://1.1.1.1/dns-query#PROXY'
+    - 'https://8.8.8.8/dns-query#PROXY'
 proxies:
 EOF
   } >"$f"
@@ -2738,9 +2765,21 @@ do_uninstall() {
 
 install_self() {
   local target="/usr/local/sbin/mihomoctl"
-  local src; src="$(readlink -f "${BASH_SOURCE[0]}")"
-  if [[ $src != "$target" ]]; then
-    install -m 0700 "$src" "$target" && ok "Installed as ${target}"
+  local src; src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  # Piping the script in (`bash <(curl ...)`, `curl ... | bash`) leaves
+  # BASH_SOURCE pointing at a /dev/fd entry or a name that no longer exists, and
+  # `install` then fails with "cannot stat". That must not look like a deploy
+  # error — everything else has already succeeded by this point.
+  if [[ -z $src || ! -f $src ]]; then
+    warn "This script is not on disk as a regular file (piped in?), so ${target} was not installed."
+    warn "Save it to the server and re-run to get the mihomoctl helper, or call the file directly."
+    return 0
+  fi
+  [[ $src == "$target" ]] && return 0
+  if install -m 0700 "$src" "$target" 2>/dev/null; then
+    ok "Installed as ${target}"
+  else
+    warn "Could not install ${target}; use the script directly instead."
   fi
   return 0
 }

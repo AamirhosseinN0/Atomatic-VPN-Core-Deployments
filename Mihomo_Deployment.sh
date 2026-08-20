@@ -2385,10 +2385,17 @@ write_client_mihomo() {
 mixed-port: 7890
 allow-lan: false
 mode: rule
-log-level: info
-ipv6: true
+# silent: mihomo keeps no log ring buffer and does no per-connection formatting.
+# This is the single biggest cut to a client's steady-state memory use.
+log-level: silent
+# The networks this deployment targets are IPv4-only; advertising IPv6 makes
+# every dual-stack dial wait out a dead AAAA path before falling back.
+ipv6: false
 unified-delay: true
-tcp-concurrent: true
+# tcp-concurrent races one dial per resolved address and keeps them all alive
+# until the first wins. On mobile clients that multiplies sockets and FDs for
+# no gain when the node is a single pinned IPv4 address.
+tcp-concurrent: false
 find-process-mode: off
 external-controller: 127.0.0.1:9090
 EOF
@@ -2399,11 +2406,15 @@ EOF
     #    needs no DNS at all. Without it the client must resolve the domain
     #    before it can dial anything, and if that lookup is blocked then all
     #    ${#ALL_KEYS[@]} nodes fail identically — which reads like a dead server.
-    #  * The resolvers carry a '#PROXY' fragment, which mihomo parses as a proxy
-    #    name and sends that query THROUGH the tunnel (config.go parseNameServer).
-    #    So DoH being censored locally stops mattering once the tunnel is up.
-    #  * `proxy-server-nameserver` is the plain-UDP fallback used only to resolve
-    #    proxy hostnames, for the case where someone strips the hosts: entry.
+    #  * The resolvers are plain UDP :53 and carry NO '#PROXY' fragment. A
+    #    '#PROXY' resolver makes mihomo route every lookup through the tunnel,
+    #    which means the proxy group must already be up before DNS can answer —
+    #    on a slow or flapping node that stalls, queues queries and has been the
+    #    source of client hangs and OOM kills. Plain resolvers answer locally.
+    #  * DoH/DoT are deliberately not used: they add a TLS session per resolver
+    #    and fail closed on networks that block :443 to public resolvers.
+    #  * `proxy-server-nameserver` resolves proxy hostnames only, for the case
+    #    where someone strips the hosts: entry.
     if valid_ipv4 "$VPN_IP"; then
       printf 'hosts:\n  %s: %s\n' "$VPN_DOMAIN" "$VPN_IP"
     fi
@@ -2411,20 +2422,24 @@ EOF
 dns:
   enable: true
   ipv6: false
+  prefer-h3: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
     - '+.lan'
     - '+.local'
   default-nameserver:
-    - 223.5.5.5
     - 1.1.1.1
+    - 8.8.8.8
+    - 9.9.9.9
   proxy-server-nameserver:
-    - 223.5.5.5
     - 1.1.1.1
+    - 8.8.8.8
+    - 9.9.9.9
   nameserver:
-    - 'https://1.1.1.1/dns-query#PROXY'
-    - 'https://8.8.8.8/dns-query#PROXY'
+    - 1.1.1.1
+    - 8.8.8.8
+    - 9.9.9.9
 proxies:
 EOF
   } >"$f"

@@ -35,15 +35,15 @@ Neither sing-box nor Xray-core implements any of those.
 ## The combination space
 
 The catalogue is not a hand-written list — it is the **cross product** of three axes, minus
-the combinations the core rejects or cannot actually use. `--protocols all` deploys all 74.
+the combinations the core rejects or cannot actually use. `--protocols all` deploys all 81.
 
 | Base | Transports | Security layers | Count |
 |---|---|---|---|
 | `vless` | tcp, ws, grpc, xhttp | tls, reality, shadowtls, restls, jls | 18 |
-| `vmess` | tcp, ws, grpc, mkcp, mekya | the above five | 15 |
+| `vmess` | tcp, ws, grpc, mkcp x5, mekya | the above five | 19 |
 | `trojan` | tcp, ws, grpc | the above five | 13 |
 | `anytls` | — | tls, shadowtls, restls, jls | 4 |
-| `ss` | plain, obfs-http, obfs-tls, kcptun | none, shadowtls, restls, jls | 7 |
+| `ss` | plain, obfs-http, obfs-tls, kcptun x4 | none, shadowtls, restls, jls | 10 |
 | `snell` | plain, obfs-http, obfs-tls | none, shadowtls, restls, jls | 6 |
 | `hysteria2` | QUIC | own TLS, optional salamander obfs, + realm server | 3 |
 | `tuic`, `shadowquic` | QUIC | own TLS / JLS | 2 |
@@ -54,6 +54,32 @@ the combinations the core rejects or cannot actually use. `--protocols all` depl
 ```bash
 sudo bash Mihomo_Deployment.sh --list-protocols     # print the whole catalogue
 ```
+
+### Variants: one parameter changed, its own listener
+
+`mkcp` and `kcptun` each carry parameters whose right value is a judgement call rather than a
+fact — which packet header to wear, whether to run congestion control, how much FEC to buy,
+whether to rotate source ports. Each of those choices gets its **own listener on its own
+port**, so it can be measured on the live path instead of argued about.
+
+| Key | Differs from the baseline by |
+|---|---|
+| `vmess-mkcp` | baseline: `header: srtp`, congestion on |
+| `vmess-mkcp-dtls` | `header: dtls` |
+| `vmess-mkcp-wechat` | `header: wechat-video` |
+| `vmess-mkcp-utp` | `header: utp` |
+| `vmess-mkcp-nocong` | `congestion: false` — wider window through loss, paid for in retransmits |
+| `ss-kcptun` | baseline: `mode fast2`, FEC 10/1, `conn 4` + `autoexpire 25` source-port rotation |
+| `ss-kcptun-static` | no rotation — the control for measuring what rotation buys |
+| `ss-kcptun-fec` | FEC 10/3 (30% overhead) for a path lossy enough to need it |
+| `ss-kcptun-fast3` | `mode fast3` — lower latency, higher packet rate and CPU |
+
+Compare them with `mihomoctl amplification`, which reports wire bytes over payload bytes per
+port. That ratio, not throughput, is what decides how long an IP survives.
+
+`wireguard` is a valid mKCP header and is deliberately **not** offered: WireGuard's own
+handshake is DPI-classified and throttled on Iranian carriers, so wearing it as a disguise
+attracts exactly the attention the disguise exists to avoid.
 
 ### What is deliberately excluded, and why
 
@@ -104,6 +130,88 @@ sudo bash Mihomo_Deployment.sh --reality-sni www.microsoft.com --steal-sni www.a
 **Both must be reachable from the server**; pre-flight checks this and warns if not. If the
 server cannot reach the decoy, the disguise fails open and looks anomalous — worse than not
 using it.
+
+### `--decoy local`: be a real site instead of impersonating one
+
+Borrowing `www.apple.com` has two costs that are easy to miss.
+
+The first is a **disagreement a passive observer can score**: your client presents
+`servername: www.apple.com` to an IP that demonstrably is not Apple's. The second is
+**latency and sockets**: RestLS dials `dest` before it reads a single client byte, relays the
+real handshake through, and — in mihomo — keeps that socket open for the whole session. So
+every proxied connection is one live connection to the decoy, and your TLS handshake
+completes one decoy-RTT after your TCP handshake did, which a prober can time.
+
+`--decoy local` replaces the third party with a TLS 1.3 nginx site on `127.0.0.1:8443`
+serving **your own domain's real certificate**:
+
+```bash
+sudo bash Mihomo_Deployment.sh --domain vpn.example.com --decoy local
+```
+
+SNI, certificate and IP now all agree, the extra round trip disappears, and the held-open
+sockets are loopback.
+
+**It is opt-in, and `--decoy auto` resolves to `steal`.** That is deliberate. Local is better
+against SNI/IP-mismatch scoring, but it is a different bet rather than a strictly better one:
+every borrowed-identity layer then presents *your* domain, so a single blocklist entry against
+a name that is already public in the Certificate Transparency logs takes out ShadowTLS, RestLS
+and JLS together — whereas a large third party's name is not realistically blockable. Iran's
+dominant censorship mechanism is still cleartext SNI blocklisting, which is exactly the axis
+where borrowing wins. Choosing that trade is the operator's call, so nothing picks it for you.
+
+The nginx site is configured for what RestLS and JLS actually need, not for general web
+serving:
+
+- `ssl_session_tickets off` — NewSessionTicket records count toward the server flight and
+  **consume RestLS script lines**, so a dest whose ticket count varies shifts the script
+  alignment from connection to connection.
+- `ssl_ecdh_curve X25519:prime256v1` — both RestLS and JLS reject a HelloRetryRequest
+  outright, so the curve the browser fingerprint puts its first key_share on has to be
+  accepted first time.
+- `TLSv1.2 TLSv1.3` — 1.3 for the normal path, 1.2 kept so an old prober gets a real answer
+  rather than an alert no real site would send.
+- No `listen 80` — certbot renews standalone on port 80 and nginx must not hold it.
+
+The honest trade: you are no longer impersonating a large site, you are a small one. That is
+the Trojan model, and it is a different bet, not a strictly better one.
+
+### The RestLS script is the protocol
+
+`res-tls` without a `restls-script` is **not** "RestLS with no shaping" — both halves fall
+back to the same built-in default string, so every untouched RestLS deployment on the
+internet emits one identical record-length sequence. That is a stable, publicly known
+signature, and an easier one to match than the TLS-in-TLS record pattern RestLS exists to
+hide. Shipping the upstream README's example string has the same problem for the same reason.
+
+This script therefore **generates one per deployment, per direction** — the server's programme
+shapes server→client records, the client's shapes client→server, and they are independent
+programmes (commands travel in-band; neither side ever compares its script against the
+peer's). Both are printed in `README.txt` and kept in state so `regen-sub` does not change
+them.
+
+```
+<target>[ ('?'|'~') <range> ][ '<' <n> ]      comma-separated
+  ~   re-rolls per record — this is what actually randomises anything
+  ?   resolves ONCE at parse time and is then cached per process, so it is a
+      per-server constant shared by every user until restart. Only honest on
+      record 1, where a fixed-size preamble is plausible.
+  <n  asks the peer for n fake records AND blocks the sender until one comes
+      back: one full round trip each, on every connection. Budget: 1-2 total.
+```
+
+Override with `--restls-script`, which is validated against the parser's real limits
+(`target ≤ 32767`, `range ≤ 32767`, `target+range ≤ 32768`, `n < 255`, no empty entries, no
+`?0`). **Do not ship a script anyone else has** — the entire claim of the design is that no
+two deployments share one.
+
+`--restls-min-record-len` defaults to `0`, meaning "leave the server's built-in 15". Raising
+it pads every short record to a uniform floor, which is a signature in its own right; set it
+only if you have measured genuinely short records on your own path. `rate-limit` is left
+unset on both `res-tls` and `jls-config` for the same class of reason: it throttles only the
+relay a failed prober gets, so any value makes the server deliver the decoy at a capped,
+unnaturally smooth bitrate the real site does not — turning a byte-perfect impersonation into
+a measurable one.
 
 ### How the certificate is obtained
 
@@ -170,7 +278,7 @@ Written to `/root/mihomo-clients/`:
 | `client-singbox.json` | sing-box client config, compatible subset |
 | `README.txt` | full port map, per-node artefact matrix, all credentials |
 
-**Only 24 of the 74 nodes have a share-link form**, and that is not a shortcut — no URI
+**Only 24 of the 81 nodes have a share-link form**, and that is not a shortcut — no URI
 grammar exists in any client for Snell, ShadowQUIC, Sudoku, Mieru, TrustTunnel, the
 mKCP/Mekya/TLS-mirror transports, or any ShadowTLS / RestLS / JLS wrapper. Emitting a link
 for those would produce something no client can import. They all live in the YAML instead.
@@ -183,10 +291,10 @@ totals row, so it is always explicit which artefact carries which node:
   vless-tcp-tls                tcp    yes    yes    yes       40000
   ...
   hysteria2-realm              tcp    no     no     no        40065
-  TOTAL 74                            73     24     20
+  TOTAL 81                            80     24     20
 ```
 
-**73 of the 74, not all 74.** The YAML holds every node you can actually dial. The one
+**80 of the 81, not all 81.** The YAML holds every node you can actually dial. The one
 exception is `hysteria2-realm`, which is not a proxy at all: it is the HTTPS rendezvous
 endpoint that Hysteria2 nodes register with through `realm-opts`, so there is no `proxies:`
 entry it could have. It is deployed and listening, but nothing in the generated config
@@ -207,6 +315,8 @@ sudo bash Mihomo_Deployment.sh status          # service + listening ports
 sudo bash Mihomo_Deployment.sh check           # re-run every health check
 sudo bash Mihomo_Deployment.sh update          # upgrade mihomo
 sudo bash Mihomo_Deployment.sh regen-sub       # rebuild client bundles from state
+sudo bash Mihomo_Deployment.sh amplification   # wire bytes vs payload bytes, per port
+sudo bash Mihomo_Deployment.sh pmtu <host>     # largest unfragmented UDP payload to <host>
 sudo bash Mihomo_Deployment.sh uninstall       # remove configuration
 ```
 
@@ -235,8 +345,193 @@ After a deploy the script installs itself as `/usr/local/sbin/mihomoctl` (when r
 | `--api-listen <ip:port>` | `127.0.0.1:9090` | RESTful controller; `''` disables |
 | `--no-kernel-tuning` | tuning on | |
 | `--firewall <auto\|ufw\|iptables\|none>` | `auto` | |
+| `--no-metering` | metering on | Skip the nftables byte counters behind `amplification` |
 | `--serve-sub` | off | Also serve the subscription over plain HTTP |
 | `--skip-preflight` | off | Skip pre-flight checks |
+| `--decoy <auto\|local\|steal>` | `auto` → `steal` | Where probers get relayed; see camouflage above |
+| `--decoy-port <n>` | `8443` | Loopback port for the local decoy |
+| `--restls-script <s>` | generated | Override the RestLS record programme |
+| `--restls-min-record-len <n>` | `0` | `0` leaves the server's built-in 15 |
+| `--client-down-mbps <n>` | `60` | Client downlink — sizes the download window |
+| `--client-up-mbps <n>` | `15` | Client uplink — the expensive one to get wrong |
+| `--server-up-mbps <n>` | `1000` | Server uplink |
+| `--server-down-mbps <n>` | `1000` | Server downlink |
+| `--rtt-ms <n>` | `120` | Round-trip time to the clients |
+| `--loss-pct <n>` | `2` | Guides the FEC ratio only |
+| `--kcp-mtu <n>` | `1200` | QUIC's safe-datagram floor; survives mobile paths |
+| `--mkcp-tti <n>` | `25` | mKCP tick, ms; must divide 1000 exactly |
+| `--probe-interval <n>` | `60` | Client health-check interval, seconds |
+| | | `lazy: false` is set on `FAILOVER` only — see below |
+| `--brutal` / `--no-brutal` | off | TCP Brutal over smux; see below |
+
+---
+
+## Transport tuning
+
+mKCP and kcp-tun are **window-based**, and a window is sized from the link of the side that
+writes the number. A German VPS and an Iranian handset do not share a link, so one set of
+numbers cannot be correct for both ends — and the end it is wrong for is always the client,
+where a window meant for a 1 Gbps port becomes seconds of standing queue that every DNS
+lookup and TCP ACK then waits behind.
+
+Nothing here is hard-coded. Six numbers describe the path, and every window, buffer, rate
+limit and FEC ratio is derived from them:
+
+```bash
+sudo bash Mihomo_Deployment.sh --domain vpn.example.com \
+     --client-down-mbps 60 --client-up-mbps 15 --rtt-ms 120
+```
+
+The derivation inverts mihomo's own formula
+(`transport/mkcp/config.go`: `inFlight = capacity × 1048576 / mtu / (1000/tti)`), so
+`uplink-capacity` is treated as what it is — a window dial whose product with `tti` sets
+bytes in flight — rather than as the link speed its name suggests. The two sides then carry
+**deliberately different** values:
+
+| | server writes | client writes |
+|---|---|---|
+| `uplink-capacity` / `sndwnd` | sized for your **download** | sized for your **upload** |
+| `downlink-capacity` / `rcvwnd` | window advertised for uploads | window advertised for downloads |
+| `write-buffer` / `sockbuf` | two windows of queue, no more | same, at client scale |
+
+Only `seed`/`header`/`mtu`/`tti` (mKCP) and
+`key`/`crypt`/`mode`/`mtu`/`datashard`/`parityshard`/`nocomp` (kcp-tun) have to match. A
+`nocomp` mismatch in particular corrupts the stream silently rather than failing.
+
+Things worth knowing that are not obvious from the upstream docs:
+
+- **Compression is ON by default** in kcp-tun and the payload is already AEAD ciphertext, so
+  snappy expands it by 8 bytes per write while burning CPU on both ends. `nocomp: true` is
+  set on both sides.
+- **FEC cannot be turned off.** `FillDefaults` rewrites `datashard: 0` → 10 and
+  `parityshard: 0` → 3, so `0/0` does not mean "no FEC", it means 30% overhead. The only real
+  knob is the ratio, and `--loss-pct` picks it: `<1%` → 10/1, `1–3%` → 10/2, `4–9%` → 10/3,
+  `≥10%` → 20/10 (a longer group averages bursts out better than 10/5 at the same overhead).
+  `ss-kcptun-fec` always sits exactly one tier above that baseline, so the pair is a real A/B.
+- **`ratelimit` caps the WIRE rate, and FEC is charged against it.** It is set to 90% of the
+  link so the bottleneck queue stays short, which means payload throughput lands at roughly
+  `0.9 × link ÷ (1 + parity/data)` — about 82% of the link at 10/1, 69% at 10/3. That is the
+  honest price of running FEC behind a sender with no congestion control; the alternative is
+  an uncapped blast.
+- **`mode: fast` does not enable nodelay** (it is `nodelay 0, interval 30`). The baseline
+  uses `fast2`; `mode` overwrites any explicit nodelay/interval/resend/nc, so those are never
+  emitted.
+- **`conn` / `autoexpire` / `scavengettl` are client-only in effect** — they exist in the
+  listener struct but `transport/kcptun/server.go` never reads them, so they are emitted in
+  `plugin-opts` and nowhere else. With `conn 4` the client's windows are divided by four, or
+  rotation would quietly multiply the queue it exists to shorten.
+- **`ratelimit`** is the only real rate limiter kcp-tun has: every mode sets `nc=1`, i.e. no
+  congestion control at all. It counts FEC and retransmits, so it also bounds amplification.
+- **`read-buffer` on mKCP is inert** in current mihomo — `receivingBufferSize()` has no call
+  site. It is emitted for symmetry and does nothing today.
+- **`--kcp-mtu` is a conservative constant, not a discovered value.** PMTU discovery relies on
+  ICMP, and ICMP is filtered on exactly the networks this matters for, so discovery
+  black-holes silently. `mihomoctl pmtu <client-ip>` measures the largest unfragmented
+  datagram to a real client address by binary search on the don't-fragment bit — an ICMP
+  payload of *P* bytes and a KCP packet of *P* bytes put the same *P+28* bytes on the wire, so
+  the answer is directly the largest safe `--kcp-mtu`. It measures **this server's path to
+  that address**, and no answer at any size means "ICMP is filtered", not "the MTU is tiny".
+
+### ALPN: a correction worth recording
+
+A natural-looking bug report is that the generated client YAML carries no `alpn:` while the
+share links do, so the YAML nodes "advertise no ALPN" — which no browser does. Reading the
+source, the premise is wrong.
+
+Every node here sets `client-fingerprint: chrome`, so the ClientHello is assembled by uTLS
+from the Chrome parrot template, and **that template's ALPN extension is what goes on the
+wire** — not `tls.Config.NextProtos`. mihomo demonstrates this itself: the only way it can
+force `http/1.1` for WebSocket is `BuildWebsocketHandshakeState`, which walks
+`conn.Extensions` and rewrites the `ALPNExtension` by hand *after* the handshake state is
+built. If `NextProtos` were sufficient, that function would not need to exist.
+
+So `alpn:` is emitted only where it can actually matter and cannot hurt:
+
+| Security layer | What `alpn:` reaches | Emitted? |
+|---|---|---|
+| `reality` | nothing — `GetRealityConn` never receives the `tls.Config` | no |
+| `shadowtls` | already defaults to `["h2","http/1.1"]` when unset | no |
+| `jls` | passed to `jls.NewClient`; a non-nil value calls `overrideUTLSALPN`, which rewrites the ALPN extension inside a pristine Chrome ClientHello **and drops the ApplicationSettings extension when `h2` is absent** | **no** |
+| `tls`, `restls` | `NextProtos`, which the non-uTLS path and RestLS's own config consume | yes |
+
+Where it is emitted, the value is the **browser's** list (`h2`, `http/1.1`), not the
+transport-minimal one the share links use — bare `h2` would be a novel fingerprint if it ever
+reached the wire, and the server still selects `h2` for gRPC/XHTTP by preference order.
+WebSocket gets `http/1.1` alone, since an `h2` selection there breaks the Upgrade.
+
+### TCP Brutal is off by default
+
+`--brutal` is available and deliberately not the default. Brutal is a **fixed-rate** sender
+that ignores loss by design. On a path where loss is frequently the censor rather than
+congestion, that converts every loss event into a sustained burst — and a sudden burst is one
+of the documented triggers for having a flow killed and the IP graylisted. If you turn it on,
+the rates must be **measured**: they are negotiated down to
+`min(peer receive rate, own send rate)`, so an inflated number does not go faster, it
+retransmits into a policer.
+
+### Multiplexing
+
+The four stream-oriented families (`vless`, `vmess`, `trojan`, `ss`) get sing-mux: `smux` on
+the client, `mux-option` on the listener. The payoff is not throughput, it is **connection
+count** — ISP QoS is reported to bite past roughly 4–8 concurrent connections to one IP, and
+every new connection is another first-two-packets event for a protocol whitelister to score.
+
+`anytls` and `snell` are excluded because their listeners have no `mux-option` at all
+(`anytls` has native session multiplexing and never routes through the sing handler, so a
+client `smux` on it is silently never demultiplexed). The QUIC family already multiplexes
+natively, and kcp-tun runs its own smux inside the tunnel.
+
+Padding is set on the **client** side only, and that is deliberate. On a listener,
+`mux-option.padding: true` is an *enforcement*: sing-mux rejects every unpadded mux connection
+once the server demands it. The generated `client-mihomo.yaml` pads — but a `vless://` share
+link has no field that can express sing-mux padding, and neither does the generated sing-box
+config, so enforcing it server-side would turn "this client enabled mux" into a hard, silent
+failure for everyone outside this script's own YAML. Setting it client-side puts the same
+padding on the wire (the server honours a padded connection whether or not it demands one)
+with nobody locked out.
+
+The listener therefore emits `mux-option` only when `--brutal` is on, since brutal rates are
+the one thing that genuinely has to be declared server-side. The mux *service* itself is
+always active on the eight supported inbound types — there is no on/off switch.
+
+### Failover
+
+The client config carries two automatic groups, because they fail over on different principles
+and this network kills flows on a timescale neither covers alone:
+
+| Group | Type | Behaviour |
+|---|---|---|
+| `AUTO` | `url-test` | Lowest latency of everything alive. Best steady-state pick, but it memoises its choice in a singleflight with a **10-second TTL**, so it can keep handing out a node the health checker has already buried. |
+| `FAILOVER` | `fallback` | First node in list order that is alive, and it moves the moment it is not. No latency optimisation, no 10 s cache — the one to select when nodes are dying. |
+
+`interval` is seconds (the stock default is 300 — five minutes of a dead node selected, against
+flow kills measured at 7–35 s), `tolerance` is milliseconds, and `timeout` is milliseconds.
+`timeout` does double duty: it is both the per-probe deadline *and* the window in which
+`max-failed-times` failures must occur, so shortening one shortens the other — hence the
+matching drop to `max-failed-times: 2`.
+
+`lazy: false` is set on `FAILOVER` alone. `lazy` only decides whether the group you are *not*
+using stays warm — the group you have selected is being dialled through, so it probes on every
+tick regardless. Setting it on both groups would double the probe traffic to buy nothing, since
+the two groups have separate health checkers and do not share results. With the full catalogue
+that difference is ~80 extra dials a minute to one IP across ~80 ports, which is a
+port-scan-shaped pattern and the opposite of what the multiplexing above is for.
+
+### Measuring instead of guessing
+
+```bash
+mihomoctl amplification            # wire bytes / payload bytes, per listener port
+mihomoctl amplification --reset    # zero the counters and re-snapshot the baseline
+mihomoctl pmtu 1.2.3.4             # largest unfragmented UDP payload to a client address
+```
+
+`check` answers "is the port bound", which is the wrong question here. The number that
+decides how many days an IP survives is bytes-on-wire over bytes-delivered, because the
+graylist that matters is volume-driven — blocks have been reported after roughly 40 GB in two
+hours. Every retransmit, FEC parity packet and padding record is charged against that budget.
+The wire side is counted by nftables byte counters (chain priority `-300`, so a packet the
+firewall later drops still counts — it still crossed the wire); the payload side comes from
+mihomo's own RESTful API.
 
 ---
 
@@ -261,14 +556,14 @@ sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols recommend
 
 | Preset | Meaning |
 |---|---|
-| `all` | every valid combination (74) — the default |
+| `all` | every valid combination (81) — the default |
 | `recommended` | a curated 14 covering every distinct technique |
 | `core` | the 8 classics the sing-box / Xray scripts also offer |
 | families | `vless` `vmess` `trojan` `anytls` `ss` `snell` `mieru` `sudoku` `trusttunnel` `shadowquic` `quic` `exotic` |
 | by security | `reality` `shadowtls` `restls` `jls` `tls` |
 | by transport | `ws` `grpc` `xhttp` `mkcp` `mekya` `kcptun` |
 
-Deploying all 74 means 74 listening sockets and 74 firewall openings. It works — but
+Deploying all 81 means 81 listening sockets and 81 firewall openings. It works — but
 `recommended` is the saner default for a production node, and the script says so.
 
 ---
@@ -293,7 +588,7 @@ Deploying all 74 means 74 listening sockets and 74 firewall openings. It works �
 
 ## Verification
 
-The catalogue was booted end-to-end against **mihomo v1.19.30**: all 74 listeners bind with
+The catalogue was booted end-to-end against **mihomo v1.19.30**: all 81 listeners bind with
 zero errors, both the server config and the generated client YAML pass `mihomo -t`, and real
 traffic was proxied through the nodes with a real mihomo client — including every
 mihomo-exclusive protocol (ShadowQUIC, Sudoku with and without HTTP masking, Mieru over TCP

@@ -17,18 +17,19 @@
 #     * share links + base64 subscription  — the subset that has a URI form
 #     * a sing-box client config.json      — the subset sing-box can do
 #
-#  The combination space (74 listeners with --protocols all):
+#  The combination space (81 listeners with --protocols all):
 #     vless    tcp | xhttp                  x  tls | reality | shadowtls
 #                                              | restls | jls
 #              ws     (no reality), grpc (no restls)                      (18)
 #     vmess    tcp                          x  the above five             (5)
 #              ws     (no reality), grpc (no restls)                      (8)
-#              mkcp (UDP, no TLS), mekya (h2-over-kcp inside TLS)         (2)
+#              mkcp x {srtp, dtls, wechat-video, utp, srtp-no-congestion}   (5)
+#              mekya (h2-over-kcp inside TLS)                               (1)
 #     trojan   tcp                          x  the above five             (5)
 #              ws     (no reality), grpc (no restls)                      (8)
 #     anytls   tls | shadowtls | restls | jls                              (4)
-#     ss       plain x (none|shadowtls|restls|jls), obfs-http, obfs-tls,
-#              kcptun                                                      (7)
+#     ss       plain x (none|shadowtls|restls|jls), obfs-http, obfs-tls     (6)
+#              kcptun x {rotate, static, fec, fast3}                        (4)
 #     snell    plain x (none|shadowtls|restls|jls), obfs-http, obfs-tls     (6)
 #     hysteria2, hysteria2-obfs, hysteria2-realm                           (3)
 #     tuic, shadowquic                                                     (2)
@@ -38,7 +39,7 @@
 #
 #  Every combination emitted here is source-verified against MetaCubeX/mihomo
 #  (listener/inbound/*.go struct tags, listener/parse.go, the *_interop_test.go
-#  fixtures) and was booted end-to-end against mihomo v1.19.30 — all 78 bind and
+#  fixtures) and was booted end-to-end against mihomo v1.19.30 — all 81 bind and
 #  carry traffic.  Combinations the core rejects or cannot actually use — two
 #  security layers on one listener, mkcp with shadow-tls, kcptun with a security
 #  layer, mekya with ws/grpc, and WebSocket with REALITY (see build_catalogue) —
@@ -51,6 +52,8 @@
 #     ./Mihomo_Deployment.sh check          re-run every health check
 #     ./Mihomo_Deployment.sh update         upgrade mihomo to the latest build
 #     ./Mihomo_Deployment.sh regen-sub      rebuild client bundles from state
+#     ./Mihomo_Deployment.sh amplification  wire bytes vs payload bytes per port
+#     ./Mihomo_Deployment.sh pmtu <host>    largest unfragmented UDP payload to <host>
 #     ./Mihomo_Deployment.sh uninstall      remove configuration
 #
 #  After deployment this file installs itself as /usr/local/sbin/mihomoctl.
@@ -70,6 +73,9 @@ readonly MH_CERT_DIR="${MH_HOME}/cert"
 readonly MH_CERT_FULL="${MH_CERT_DIR}/fullchain.pem"
 readonly MH_CERT_KEY="${MH_CERT_DIR}/privkey.pem"
 readonly MH_RENEW_HOOK="${MH_CERT_DIR}/deploy-hook.sh"
+readonly DECOY_SITE="/etc/nginx/sites-available/mihomo-decoy.conf"
+readonly DECOY_ROOT="/var/www/mihomo-decoy"
+readonly DECOY_UNIT_DROPIN="/etc/systemd/system/mihomo.service.d/20-decoy.conf"
 readonly MH_BIN="/usr/local/bin/mihomo"
 readonly CLIENT_OUT_DIR="/root/mihomo-clients"
 readonly LOGFILE="/var/log/mihomo-deploy.log"
@@ -136,11 +142,63 @@ SS_METHOD="2022-blake3-aes-128-gcm"
 SNELL_VERSION="4"             # mihomo's snell listener speaks v1..v4
 HY2_OBFS="salamander"         # used by the hysteria2-obfs node only
 
+# --- link profile ------------------------------------------------------------
+# Window-based transports (mKCP, kcp-tun) size their in-flight window from
+# numbers that describe THE LOCAL LINK OF THE SIDE THAT WRITES THEM.  A German
+# VPS and an Iranian handset do not share a link, so the same numbers on both
+# sides are wrong on at least one of them.  Everything window-shaped below is
+# derived from these six values instead of being hard-coded; see _bdp_pkts.
+SRV_UP_MBPS="1000"            # server uplink   (a 1 Gbps port)
+SRV_DOWN_MBPS="1000"          # server downlink
+# Deliberately the LOW end of a 60-100 Mbps cohort, and an uplink well under the
+# 12 Mbps Iranian mobile median. Under-declaring costs a little throughput;
+# over-declaring makes a rate-based sender burst into a policer, and on this path
+# loss is usually a censorship signal rather than congestion — so a burst that
+# would merely be inefficient elsewhere is what gets the flow, and eventually the
+# IP, killed here.
+CLI_DOWN_MBPS="60"            # client downlink — the number that sets download speed
+CLI_UP_MBPS="15"              # client uplink   — the number that sets upload speed
+PATH_RTT_MS="120"             # Iran -> Frankfurt: 75-85 ms DC, +access network
+PATH_LOSS_PCT="2"             # healthy-path loss; drives the FEC ratio only
+
+# KCP framing. 1200 is QUIC's own safe-datagram floor and survives every
+# documented Iranian path including mobile. It is not a guess at the real PMTU:
+# ICMP is suppressed on MCI/TCI after a couple of packets, so PMTU discovery
+# black-holes silently and there is nothing to discover with. A KCP packet that
+# fragments is lost outright when either fragment is dropped, so the safe value
+# wins over the efficient one.
+KCP_MTU="1200"
+MKCP_TTI="25"                 # mKCP tick, ms. Must divide 1000 (see _mkcp_cap).
+
+# Camouflage destination for the borrowed-identity layers.
+#   steal — relay the handshake to ${STEAL_SNI}:443 (one extra RTT per connection,
+#           and the client presents an SNI that does not match this IP)
+#   local — relay it to a local TLS 1.3 site serving YOUR domain's real
+#           certificate (no extra RTT, and SNI, certificate and IP all agree)
+#   auto  — local when a real certificate is available, steal otherwise
+DECOY_MODE="auto"
+DECOY_PORT="8443"             # loopback port the local decoy listens on
+DECOY_RESOLVED=""             # steal | local, decided in setup_decoy
+
+# 0 = omit the key and let the server use its built-in 15. Raising it pads every
+# short record to a uniform floor, which is itself a signature; it is only worth
+# setting if you have measured genuinely short records on your own path.
+RESTLS_MIN_RECORD_LEN="0"
+PROBE_INTERVAL="60"           # client url-test interval, seconds
+PROBE_TIMEOUT="3000"          # client health-check timeout, ms
+# TCP Brutal is a FIXED-RATE congestion control: it ignores loss by design. On a
+# path where loss is frequently the censor rather than the network, that turns
+# every loss event into a sustained burst — and a sudden burst is one of the
+# documented triggers for having the flow killed and the IP graylisted. Off by
+# default here for that reason; --brutal turns it on with measured rates.
+BRUTAL="no"
+
 API_LISTEN="127.0.0.1:9090"   # RESTful controller; loopback only by default
 API_SECRET=""
 
 AUTO_PORTS="yes"
 KERNEL_TUNING="yes"
+METERING="yes"          # nftables byte counters behind `mihomoctl amplification`
 FIREWALL="auto"
 
 SUB_HOST="no"
@@ -155,6 +213,8 @@ MH_USER="mihomo"
 MH_VERSION=""
 
 CMD="deploy"
+METER_RESET="no"
+PMTU_TARGET=""
 
 # Per-protocol ports (filled in by assign_ports / state).
 declare -A PORT
@@ -177,6 +237,11 @@ TUIC_UUID=""; TUIC_PASSWORD=""
 HY2_OBFS_PASSWORD=""
 REALM_TOKEN=""
 WS_PATH=""; GRPC_SVC=""; XHTTP_PATH=""; MKCP_SEED=""; OBFS_HOST=""
+KCPTUN_KEY=""                 # kcp-tun's own secret — NOT shared with trojan/hy2
+RESTLS_SCRIPT_S=""            # server->client record-length programme
+RESTLS_SCRIPT_C=""            # client->server programme (independent of the above)
+RESTLS_VERSION_HINT="tls13"   # confirmed against the decoy in preflight
+DECOY_ALPN="h2,http/1.1"      # what the decoy actually negotiates
 CERT_PIN=""
 
 # =============================================================================
@@ -202,15 +267,23 @@ CERT_PIN=""
 #      simple-obfs are Shadowsocks-only; obfs-opts is Snell-only.
 # =============================================================================
 declare -a ALL_KEYS=()
-declare -A K_BASE=() K_XPORT=() K_SEC=() K_PORTS=()
+declare -A K_BASE=() K_XPORT=() K_SEC=() K_PORTS=() K_VAR=()
 
 # _cat_add <key> <base> <transport> <security> <candidate ports...>
 _cat_add() {
   local key=$1 base=$2 xport=$3 sec=$4; shift 4
   ALL_KEYS+=("$key")
   K_BASE[$key]="$base"; K_XPORT[$key]="$xport"; K_SEC[$key]="$sec"
-  K_PORTS[$key]="$*"
+  K_PORTS[$key]="$*"; K_VAR[$key]=""
 }
+
+# _cat_var <key> <variant>
+# A transport parameter whose right value is a judgement call rather than a fact
+# — which packet header to wear, whether to run congestion control, how much FEC
+# to pay for — becomes a variant here and gets its own listener, so the choice
+# can be measured on the live path instead of argued about.  The variant tag is
+# read back by _mkcp_* / _kcptun_* at emit time and by nothing else.
+_cat_var() { K_VAR[$1]="$2"; }
 
 # Candidate ports are drawn from a per-family band so that a full 81-listener
 # deployment stays readable in `ss -tulpn`; three candidates each, then
@@ -218,7 +291,7 @@ _cat_add() {
 _band() { local base=$1 n=$2; printf '%s %s %s' "$((base+n))" "$((base+300+n))" "$((base+600+n))"; }
 
 build_catalogue() {
-  ALL_KEYS=(); K_BASE=(); K_XPORT=(); K_SEC=(); K_PORTS=()
+  ALL_KEYS=(); K_BASE=(); K_XPORT=(); K_SEC=(); K_PORTS=(); K_VAR=()
   local x s n
 
   # grpc + restls is absent everywhere below too. Both halves work on their own
@@ -271,7 +344,23 @@ build_catalogue() {
       _cat_add "vmess-${x}-${s}" vmess "$x" "$s" "$(_band 31000 $n)"; n=$((n+1))
     done
   done
-  _cat_add vmess-mkcp  vmess mkcp  none "$(_band 31000 $n)"; n=$((n+1))
+  # mKCP variants. `header` is the whole disguise — these packets carry no TLS at
+  # all — and `congestion` is the throughput/retransmit trade, so each gets its
+  # own listener and can be A/B-ed on the live path.
+  #
+  # The ports are deliberately unremarkable high ports rather than the "matching"
+  # service ports the header names suggest. There is no evidence that Iranian
+  # networks treat the RTP range (16384-32767) or STUN/3478 as privileged, and
+  # UDP/443 is measurably the WORST choice because that is where the QUIC filter
+  # lives. What is documented is that UDP drops are keyed on the full
+  # (srcIP, srcPort, dstIP, dstPort) tuple, so a fresh port resurrects a
+  # blackholed path — which makes the port a rotation knob, not a disguise.
+  _cat_add vmess-mkcp        vmess mkcp none "27411 33507 41209"; _cat_var vmess-mkcp        srtp
+  _cat_add vmess-mkcp-dtls   vmess mkcp none "24683 31097 44521"; _cat_var vmess-mkcp-dtls   dtls
+  _cat_add vmess-mkcp-wechat vmess mkcp none "22157 36841 47309"; _cat_var vmess-mkcp-wechat wechat-video
+  _cat_add vmess-mkcp-utp    vmess mkcp none "29063 38219 45707"; _cat_var vmess-mkcp-utp    utp
+  _cat_add vmess-mkcp-nocong vmess mkcp none "26339 34751 42863"; _cat_var vmess-mkcp-nocong srtp-nocong
+  n=$((n+1))
   _cat_add vmess-mekya vmess mekya tls  "$(_band 31000 $n)"
 
   # --- Trojan: tcp/grpc x 5, ws x 4 = 14 ------------------------------------
@@ -297,7 +386,19 @@ build_catalogue() {
   _cat_add ss-jls       ss plain     jls       "$(_band 34000 3)"
   _cat_add ss-obfs-http ss obfs-http none      "$(_band 34000 4)"
   _cat_add ss-obfs-tls  ss obfs-tls  none      "$(_band 34000 5)"
-  _cat_add ss-kcptun    ss kcptun    none      "$(_band 34000 6)"
+  # kcp-tun variants. It wears no header camouflage at all — the wire is
+  # indistinguishable from random bytes — so nothing about it is plausible on any
+  # port, and the ports below are chosen only to be unremarkable and spread out.
+  #
+  # Rotation is the DEFAULT here rather than a variant, because it is the one
+  # mitigation the measurement literature supports directly: UDP blackholing is
+  # keyed on the 4-tuple, so retiring each connection onto a fresh source port
+  # before the middlebox acts is a structural fix rather than a tuning guess.
+  # -static exists to measure what rotation is actually buying you.
+  _cat_add ss-kcptun        ss kcptun none "23417 31861 43229"; _cat_var ss-kcptun        rotate
+  _cat_add ss-kcptun-static ss kcptun none "25603 35129 46811"; _cat_var ss-kcptun-static static
+  _cat_add ss-kcptun-fec    ss kcptun none "21739 32467 44093"; _cat_var ss-kcptun-fec    fec
+  _cat_add ss-kcptun-fast3  ss kcptun none "28871 37253 48619"; _cat_var ss-kcptun-fast3  fast3
 
   # --- Snell: 4 security layers + 2 obfs modes = 6 --------------------------
   _cat_add snell-plain     snell plain     none      "$(_band 35000 0)"
@@ -308,6 +409,12 @@ build_catalogue() {
   _cat_add snell-obfs-tls  snell obfs-tls  none      "$(_band 35000 5)"
 
   # --- QUIC family (each carries its own TLS; no transport axis) ------------
+  # 443/udp is kept as the first candidate. There is a real argument for moving
+  # it — QUIC Initial packets from Iran are reported dropped at close to 100%,
+  # and the filter is port-sensitive — but 443/udp is also the only UDP port
+  # carrying plausible cover traffic, and the same flow on a random high port is
+  # anomalous everywhere rather than just in Iran. Move it with --list-protocols
+  # + manual port review if your own measurements say otherwise.
   _cat_add hysteria2       hysteria2  quic tls  "443 8443 36000"
   _cat_add hysteria2-obfs  hysteria2  quic obfs "36001 36301 36601"
   # A realm server is the HTTPS rendezvous endpoint hysteria2 nodes register
@@ -363,17 +470,31 @@ proto_desc() {
   local key=$1
   local b="${K_BASE[$key]}" x="${K_XPORT[$key]}" s="${K_SEC[$key]}"
   local xd sd
+  local v="${K_VAR[$key]:-}"
   case "$x" in
     tcp)       xd="raw TCP" ;;
     ws)        xd="WebSocket" ;;
     grpc)      xd="gRPC" ;;
     xhttp)     xd="XHTTP" ;;
-    mkcp)      xd="mKCP (UDP)" ;;
+    mkcp)
+      case "$v" in
+        srtp-nocong)  xd="mKCP srtp, no cong." ;;
+        wechat-video) xd="mKCP wechat-video" ;;
+        "")           xd="mKCP (UDP)" ;;
+        *)            xd="mKCP ${v} header" ;;
+      esac ;;
     mekya)     xd="Mekya (h2 over KCP)" ;;
     plain)     xd="raw TCP" ;;
     obfs-http) xd="simple-obfs http" ;;
     obfs-tls)  xd="simple-obfs tls" ;;
-    kcptun)    xd="KCPTun (UDP)" ;;
+    kcptun)
+      case "$v" in
+        rotate) xd="KCPTun, port rotation" ;;
+        static) xd="KCPTun, no rotation" ;;
+        fec)    xd="KCPTun, FEC 10/3" ;;
+        fast3)  xd="KCPTun, mode fast3" ;;
+        *)      xd="KCPTun (UDP)" ;;
+      esac ;;
     quic)      xd="QUIC" ;;
     raw)       xd="raw TCP" ;;
     httpmask)  xd="HTTP-masked" ;;
@@ -511,6 +632,121 @@ gen_uuid() {
 gen_b64key() { openssl rand -base64 "${1:-16}" | tr -d '\n'; }
 gen_hex()    { openssl rand -hex "${1:-8}"    | tr -d '\n'; }
 
+# A Restls record-length programme, generated per deployment, per direction.
+#
+# Restls is not "off" without one: both halves substitute the SAME built-in
+# default — "250?100<1,350~100<1,600~100,300~200,300~100" — when the key is
+# empty (restls_utils.go:248, restls_server.go:231-234). Every untouched Restls
+# deployment therefore emits one identical record-length sequence, which is a
+# stable public signature and a considerably easier one to match than the
+# TLS-in-TLS pattern Restls exists to hide. Shipping the README's example string
+# has the same problem for the same reason. The design's whole claim is that
+# each deployment writes its own; this generates one.
+#
+# Grammar, from the parser (restls_utils.go:146-231), entries comma-separated:
+#     <target>[ ('?'|'~') <range> ][ '<' <n> ]
+#   ?  resolves ONCE at parse time and mihomo memoises the parse per process, so
+#      a `?` line is a constant shared by every connection and every user on that
+#      listener until restart — learnable from a handful of flows. It is only
+#      honest on record 1, where a fixed-size preamble is genuinely plausible.
+#   ~  re-rolls per record; this is what actually randomises anything.
+#   <n asks the peer for n fake response records AND blocks the sender until one
+#      comes back — one full round trip each, paid on every connection.
+# Limits: target <= 32767, range <= 32767, target+range <= 32768, n < 255.
+# Values above 16372 are silently clamped to the TLS record ceiling.
+#
+# The two directions are INDEPENDENT programmes: the server's script indexes
+# server->client records, the client's indexes client->server, commands travel
+# in-band, and neither side ever compares its script against the peer's. So they
+# are shaped differently on purpose — responses are long, requests are short.
+# Setting only one side leaves the other on the shared default.
+#
+#   gen_restls_script <server|client>
+gen_restls_script() {
+  local dir=$1 n i t r op out=() marks=() idx lo span nmark long1 long2 base spread
+  # Everything structural is drawn, not fixed. A generator whose output always
+  # has the same entry count, the same '?' position, the same marker placement
+  # and the same two-mode length distribution replaces one exact-string
+  # signature with one shape-family signature — better, but not by much.
+  n=$(( 5 + RANDOM % 6 ))                       # 5..10 records
+
+  # 0, 1 or 2 response markers, anywhere in the first two thirds. Zero is a
+  # legitimate choice: each marker costs a full round trip on every connection.
+  marks=()
+  nmark=$(( RANDOM % 100 ))
+  if   (( nmark < 25 )); then nmark=0
+  elif (( nmark < 75 )); then nmark=1
+  else                        nmark=2; fi
+  for (( i = 0; i < nmark; i++ )); do
+    idx=$(( RANDOM % ((n * 2 + 2) / 3) ))
+    marks[$idx]=1
+  done
+
+  # Which records are the long ones is drawn too, rather than being every third.
+  long1=$(( RANDOM % n )); long2=$(( RANDOM % n ))
+
+  # Per-script base and spread, so two deployments differ in scale and not only
+  # in the individual draws.
+  if [[ $dir == client ]]; then
+    base=$(( 60 + RANDOM % 140 )); spread=$(( 90 + RANDOM % 220 ))
+  else
+    base=$(( 900 + RANDOM % 700 )); spread=$(( 80 + RANDOM % 400 ))
+  fi
+
+  for (( i = 0; i < n; i++ )); do
+    if (( i == long1 || i == long2 )); then
+      # A long record: a body frame rather than a header frame.
+      if [[ $dir == client ]]; then lo=$(( 700 + RANDOM % 900 )); span=$(( 200 + RANDOM % 900 ))
+      else                          lo=$(( 1900 + RANDOM % 1800 )); span=$(( 300 + RANDOM % 1600 )); fi
+    else
+      lo=$base; span=$spread
+    fi
+    t=$(( lo + RANDOM % span ))
+    r=$(( 20 + RANDOM % 400 ))
+    # 16372 is the real ceiling: writeOneRestlsRecord clamps to maxPlaintext
+    # minus the 12-byte auth header, so anything larger is silently truncated
+    # and the script would not mean what it says.
+    (( t > 16000 )) && t=$(( 12000 + RANDOM % 4000 ))
+    (( t + r > 16372 )) && r=$(( 16372 - t ))
+    (( r < 1 )) && r=1
+    # '?' only ever on the first record, and only sometimes: it resolves once at
+    # parse time and mihomo caches the parse per process, so a '?' line is a
+    # constant shared by every user of that listener until restart. On record 1
+    # that is plausible as a fixed-size preamble; anywhere else it is a gift.
+    op='~'; (( i == 0 && RANDOM % 3 == 0 )) && op='?'
+    out+=( "${t}${op}${r}${marks[$i]:+<1}" )
+  done
+  local IFS=','; printf '%s' "${out[*]}"
+}
+
+# Reject a script the parser would refuse, so a hand-edited --restls-script
+# fails here rather than per-connection at runtime on the server.
+valid_restls_script() {
+  local sc="${1// /}" e t r n
+  [[ -n $sc ]] || return 1
+  # An empty entry (leading, trailing or doubled comma) is skipped by mihomo's Go
+  # parser but becomes a zero-length target in the Rust reference server, which
+  # then emits header-only records without consuming data. Caught here, before
+  # word-splitting silently discards a trailing one.
+  [[ $sc == ,* || $sc == *, || $sc == *,,* ]] && return 1
+  IFS=',' read -r -a __rs <<<"$sc"
+  (( ${#__rs[@]} > 0 )) || return 1
+  for e in "${__rs[@]}"; do
+    [[ $e =~ ^([0-9]+)([~?]([0-9]+))?(\<([0-9]+))?$ ]] || return 1
+    t="${BASH_REMATCH[1]}"; r="${BASH_REMATCH[3]:-}"; n="${BASH_REMATCH[5]:-0}"
+    # A zero target makes the writer emit header-only records without consuming
+    # data, and `?0` is an empty random range that panics the Rust server — both
+    # parse fine and break at runtime, so they are rejected here instead.
+    (( 10#$t >= 1 )) || return 1
+    [[ ${e:0:${#t}+1} == "${t}?" && ${r:-0} -eq 0 ]] && return 1
+    (( 10#$t <= 32767 )) || return 1
+    (( 10#${r:-0} <= 32767 )) || return 1
+    (( 10#$t + 10#${r:-0} <= 32768 )) || return 1
+    (( 10#$n < 255 )) || return 1
+  done
+  return 0
+}
+
 urlenc() {
   local s=$1 o="" c i
   for (( i=0; i<${#s}; i++ )); do
@@ -530,6 +766,11 @@ valid_ipv4() {
   return 0
 }
 valid_domain()  { [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; }
+# 10000, not 100000: this gates the two CLIENT link prompts, and validate_tunables
+# bounds those at 1..10000. A looser prompt validator just moves the rejection
+# from "type it again" to a fatal error three lines later.
+valid_mbps()    { [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 10000 )); }
+valid_ms()      { [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 2000 )); }
 valid_label()   { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]; }
 valid_port_num(){ [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 valid_email()   { [[ -z $1 || $1 =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
@@ -552,7 +793,11 @@ save_state() {
              CERT_MODE LE_EMAIL PROTO_CHOICE SELECTED LISTEN_ADDR \
              REALITY_SNI STEAL_SNI SS_METHOD SNELL_VERSION HY2_OBFS \
              API_LISTEN API_SECRET \
-             AUTO_PORTS KERNEL_TUNING FIREWALL SUB_HOST SUB_PORT SUB_TOKEN NIC \
+             AUTO_PORTS KERNEL_TUNING FIREWALL METERING SUB_HOST SUB_PORT SUB_TOKEN NIC \
+             SRV_UP_MBPS SRV_DOWN_MBPS CLI_DOWN_MBPS CLI_UP_MBPS PATH_RTT_MS PATH_LOSS_PCT \
+             KCP_MTU MKCP_TTI BRUTAL PROBE_INTERVAL PROBE_TIMEOUT \
+             DECOY_MODE DECOY_PORT DECOY_RESOLVED DECOY_ALPN \
+             RESTLS_MIN_RECORD_LEN RESTLS_VERSION_HINT RESTLS_SCRIPT_S RESTLS_SCRIPT_C KCPTUN_KEY \
              MH_USER MH_VERSION \
              UUID PASSWORD SS_PASSWORD SNELL_PSK \
              REALITY_PRIVATE REALITY_PUBLIC REALITY_SHORTID \
@@ -590,14 +835,30 @@ selected_count() { local n=0 k; for k in $SELECTED; do n=$((n+1)); done; printf 
 needs_any_cert() {
   local k
   for k in $SELECTED; do [[ $(proto_needs_cert "$k") == yes ]] && return 0; done
+  # The local decoy serves OUR certificate on loopback, so a selection made
+  # entirely of certificate-less layers still needs one issued. Without this,
+  # collect_config takes the "nothing wants a cert" branch, hard-sets
+  # CERT_MODE=self, and --decoy local then silently downgrades to steal.
+  [[ $DECOY_MODE == local ]] && uses_decoy && return 0
   return 1
 }
-# Does any selected key borrow a real external site's TLS identity?
+# Does any selected key borrow a real EXTERNAL site's TLS identity? With the
+# local decoy nothing reaches out, so nothing needs to be reachable.
 uses_steal_site() {
   local k
+  # These three reach STEAL_SNI directly and are NOT routed through the decoy:
+  # hysteria2's masquerade URL, shadowquic's jls-upstream (which would need an
+  # HTTP/3 peer, not a TCP nginx), and sudoku's http-mask fallback. They keep the
+  # site reachable-from-the-server requirement even under --decoy local.
+  for k in $SELECTED; do
+    case "${K_BASE[$k]}" in
+      hysteria2|shadowquic) return 0 ;;
+      sudoku) [[ ${K_XPORT[$k]} == httpmask ]] && return 0 ;;
+    esac
+  done
+  _decoy_local && return 1
   for k in $SELECTED; do
     case "${K_SEC[$k]}" in shadowtls|restls|jls|tlsmirror) return 0 ;; esac
-    [[ ${K_BASE[$k]} == shadowquic ]] && return 0
   done
   return 1
 }
@@ -626,6 +887,8 @@ Subcommands:
   check                  re-run every health check
   update                 upgrade mihomo to the newest build in the chosen channel
   regen-sub              rebuild client bundles from saved state
+  amplification          wire bytes vs payload bytes per listener; --reset zeroes it
+  pmtu <host>            largest unfragmented UDP payload to <host>; sizes --kcp-mtu
   uninstall              remove configuration
 
 Common options:
@@ -656,8 +919,47 @@ Common options:
       --api-listen <ip:port>   RESTful controller (default: ${API_LISTEN}; '' disables)
       --no-kernel-tuning
       --firewall <auto|ufw|iptables|none>
+      --no-metering            skip the nftables byte counters (see 'amplification')
       --serve-sub              also serve the subscription over plain HTTP
       --skip-preflight
+
+  Camouflage destination (ShadowTLS / RestLS / JLS relay probers here):
+      --decoy <auto|local|steal>
+                               local = a TLS1.3 site on loopback serving YOUR
+                               certificate: SNI, cert and IP agree, and RestLS
+                               stops paying a round trip to a third party on
+                               every connection. Needs --cert-mode letsencrypt
+                               and installs nginx.
+                               steal (and auto, the default) = relay to
+                               --steal-sni. local is opt-in because it puts every
+                               camouflage layer behind ONE name of yours, which a
+                               single blocklist entry can then take out.
+      --decoy-port <n>         loopback port for the local decoy (default: ${DECOY_PORT})
+      --restls-script <s>      override the generated RestLS record programme.
+                               Grammar: <len>[?|~<range>][<n], comma separated.
+                               Do NOT ship a script anyone else has: the whole
+                               point is that no two deployments share one.
+      --restls-min-record-len <n>
+                               0 (default) leaves the server's built-in 15. A
+                               raised floor pads every short record to a uniform
+                               size, which is itself a signature.
+
+  Link profile — mKCP and kcp-tun derive every window and buffer from these.
+  They describe each side's OWN link, so the two ends must not share numbers:
+      --client-down-mbps <n>   default ${CLI_DOWN_MBPS}
+      --client-up-mbps <n>     default ${CLI_UP_MBPS} — the expensive one to get wrong
+      --server-up-mbps <n>     default ${SRV_UP_MBPS}
+      --server-down-mbps <n>   default ${SRV_DOWN_MBPS}
+      --rtt-ms <n>             default ${PATH_RTT_MS}
+      --loss-pct <n>           default ${PATH_LOSS_PCT} (guides the FEC ratio only)
+      --kcp-mtu <n>            default ${KCP_MTU}; QUIC's safe-datagram floor
+      --mkcp-tti <n>           default ${MKCP_TTI} ms; must divide 1000 exactly
+      --probe-interval <n>     client health-check interval, s (default ${PROBE_INTERVAL})
+      --brutal | --no-brutal   TCP Brutal over smux. Off by default: it is a
+                               fixed-rate sender that ignores loss, and on a path
+                               where loss is often the censor rather than
+                               congestion that turns into a burst that gets the
+                               flow killed.
 
 Run '${0##*/} --list-protocols' to print the full catalogue.
 EOF
@@ -679,7 +981,8 @@ list_protocols() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      deploy|info|status|check|update|regen-sub|uninstall) CMD="$1"; shift ;;
+      deploy|info|status|check|update|regen-sub|uninstall|amplification|pmtu) CMD="$1"; shift ;;
+      --reset)            METER_RESET="yes"; shift ;;
       -y|--yes)           ASSUME_YES="yes"; shift ;;
       --domain)           VPN_DOMAIN="$2"; shift 2 ;;
       --ip)               VPN_IP="$2"; shift 2 ;;
@@ -696,13 +999,31 @@ parse_args() {
       --snell-version)    SNELL_VERSION="$2"; shift 2 ;;
       --api-listen)       API_LISTEN="$2"; shift 2 ;;
       --no-kernel-tuning) KERNEL_TUNING="no"; shift ;;
+      --no-metering)      METERING="no"; shift ;;
+      --decoy)            DECOY_MODE="$2"; shift 2 ;;
+      --decoy-port)       DECOY_PORT="$2"; shift 2 ;;
+      --client-down-mbps) CLI_DOWN_MBPS="$2"; shift 2 ;;
+      --client-up-mbps)   CLI_UP_MBPS="$2"; shift 2 ;;
+      --server-up-mbps)   SRV_UP_MBPS="$2"; shift 2 ;;
+      --server-down-mbps) SRV_DOWN_MBPS="$2"; shift 2 ;;
+      --rtt-ms)           PATH_RTT_MS="$2"; shift 2 ;;
+      --loss-pct)         PATH_LOSS_PCT="$2"; shift 2 ;;
+      --kcp-mtu)          KCP_MTU="$2"; shift 2 ;;
+      --mkcp-tti)         MKCP_TTI="$2"; shift 2 ;;
+      --restls-script)    RESTLS_SCRIPT_S="$2"; RESTLS_SCRIPT_C="$2"; shift 2 ;;
+      --restls-min-record-len) RESTLS_MIN_RECORD_LEN="$2"; shift 2 ;;
+      --probe-interval)   PROBE_INTERVAL="$2"; shift 2 ;;
+      --brutal)           BRUTAL="yes"; shift ;;
+      --no-brutal)        BRUTAL="no"; shift ;;
       --firewall)         FIREWALL="$2"; shift 2 ;;
       --serve-sub)        SUB_HOST="yes"; shift ;;
       --skip-preflight)   SKIP_PREFLIGHT="yes"; shift ;;
       --list-protocols)   list_protocols; exit 0 ;;
       -h|--help)          usage; exit 0 ;;
       -*) die "Unknown option: $1  (try --help)" ;;
-      *)  die "Unexpected argument: $1  (try --help)" ;;
+      *)  # `pmtu` takes a bare target; every other subcommand takes none.
+          if [[ $CMD == pmtu && -z $PMTU_TARGET ]]; then PMTU_TARGET="$1"; shift
+          else die "Unexpected argument: $1  (try --help)"; fi ;;
     esac
   done
 }
@@ -741,6 +1062,66 @@ _expand_token() {
   esac
   (( ${#out[@]} > 0 )) || return 1
   printf '%s\n' "${out[@]}"
+}
+
+# The link profile drives every window in the config, so a typo here is a
+# silently mis-tuned deployment rather than an error. Bound it instead.
+_valid_num() { [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 )); }
+# Strip leading zeros in place. _valid_num forces base 10 for its own comparison,
+# but every consumer downstream does bare arithmetic — and bash reads a leading
+# zero as octal, so "060" would silently become 48 Mbit/s and "08" would abort
+# the emit with a syntax error halfway through writing the config.
+_denorm_zeros() {
+  local v n
+  for v in "$@"; do
+    n="${!v}"
+    [[ $n =~ ^0[0-9]+$ ]] || continue
+    n="${n#"${n%%[!0]*}"}"; [[ -z $n ]] && n=0
+    printf -v "$v" '%s' "$n"
+  done
+}
+validate_tunables() {
+  _denorm_zeros CLI_DOWN_MBPS CLI_UP_MBPS SRV_UP_MBPS SRV_DOWN_MBPS PATH_RTT_MS \
+                PATH_LOSS_PCT KCP_MTU MKCP_TTI DECOY_PORT PROBE_INTERVAL \
+                PROBE_TIMEOUT RESTLS_MIN_RECORD_LEN
+  _valid_num "$CLI_DOWN_MBPS" 1 10000  || die "--client-down-mbps must be 1..10000 (got '${CLI_DOWN_MBPS}')."
+  _valid_num "$CLI_UP_MBPS"   1 10000  || die "--client-up-mbps must be 1..10000 (got '${CLI_UP_MBPS}')."
+  _valid_num "$SRV_UP_MBPS"   1 100000 || die "--server-up-mbps must be 1..100000 (got '${SRV_UP_MBPS}')."
+  _valid_num "$SRV_DOWN_MBPS" 1 100000 || die "--server-down-mbps must be 1..100000 (got '${SRV_DOWN_MBPS}')."
+  _valid_num "$PATH_RTT_MS"   1 2000   || die "--rtt-ms must be 1..2000 (got '${PATH_RTT_MS}')."
+  _valid_num "$PATH_LOSS_PCT" 0 100    || die "--loss-pct must be 0..100 (got '${PATH_LOSS_PCT}')."
+  _valid_num "$KCP_MTU"       576 1500 || die "--kcp-mtu must be 576..1500 (got '${KCP_MTU}')."
+  _valid_num "$DECOY_PORT"    1 65535  || die "--decoy-port must be 1..65535 (got '${DECOY_PORT}')."
+  _valid_num "$PROBE_INTERVAL" 10 3600 || die "--probe-interval must be 10..3600 (got '${PROBE_INTERVAL}')."
+  # 0 means "omit the key and let the server use its built-in 15"; 16384 is the
+  # TLS record ceiling. Unvalidated, a non-numeric value reaches the `(( ... > 0 ))`
+  # guard in _sec_block and aborts the deploy part-way through writing config.yaml.
+  _valid_num "$RESTLS_MIN_RECORD_LEN" 0 16384 || die "--restls-min-record-len must be 0..16384 (0 = omit) — got '${RESTLS_MIN_RECORD_LEN}'."
+  # mihomo computes ticks as the INTEGER 1000/tti, so a tti that does not divide
+  # 1000 silently inflates every derived window by the truncation error.
+  case "$MKCP_TTI" in
+    10|20|25|40|50|100) : ;;
+    *) die "--mkcp-tti must divide 1000 exactly (10, 20, 25, 40, 50 or 100) — got '${MKCP_TTI}'." ;;
+  esac
+  if [[ -n $RESTLS_SCRIPT_S ]]; then
+    valid_restls_script "$RESTLS_SCRIPT_S" || die "--restls-script is not valid restls grammar: ${RESTLS_SCRIPT_S}"
+  fi
+  # Not fatal, but almost always a mistake worth saying out loud.
+  (( 10#$CLI_UP_MBPS > 25 )) && warn "--client-up-mbps ${CLI_UP_MBPS} is above the Iranian mobile median (~12 Mbps); over-declaring the uplink is what turns a loss event into a burst."
+
+  # Say once, here, what _mkcp_cap has to stay silent about: this profile asks
+  # for a window mihomo's uint32 arithmetic cannot express, so it is clamped and
+  # the link will not be filled at this RTT. A larger --mkcp-tti buys window for
+  # the same capacity value, which is the way out.
+  local _t
+  for _t in "$(_pkts_down)" "$(_pkts_up)"; do
+    if (( (_t * KCP_MTU * $(_mkcp_ticks) + 1048575) / 1048576 > MKCP_CAP_MAX )); then
+      warn "This link profile needs a larger mKCP window than mihomo can express (capacity > ${MKCP_CAP_MAX})."
+      warn "It is clamped, so mKCP will not fill the link at ${PATH_RTT_MS} ms RTT. Raise --mkcp-tti to widen it."
+      break
+    fi
+  done
+  return 0
 }
 
 resolve_selection() {
@@ -891,14 +1272,50 @@ collect_config() {
     ask_valid REALITY_SNI "REALITY steal target (a real external TLS1.3 site)" "$REALITY_SNI" \
       valid_domain "must be a hostname, e.g. www.microsoft.com"
   fi
-  if uses_steal_site; then
+  if uses_decoy; then
     echo
-    echo "  ShadowTLS / RestLS / JLS / TLS-mirror / ShadowQUIC forward every"
-    echo "  unauthenticated connection to a real site, so an active prober sees"
-    echo "  that site and nothing else. Pick a busy host that is NOT blocked where"
-    echo "  your clients are, and ideally not the same one as the REALITY target."
-    ask_valid STEAL_SNI "Decoy site for the certificate-less layers" "$STEAL_SNI" \
-      valid_domain "must be a hostname, e.g. www.apple.com"
+    echo "  ShadowTLS / RestLS / JLS forward every unauthenticated connection to a"
+    echo "  real TLS server, so an active prober sees that server and nothing else."
+    echo "  Which server is the choice:"
+    echo
+    echo "    ${C_BOLD}local${C_RST} – a TLS 1.3 site on loopback serving YOUR certificate."
+    echo "            SNI, certificate and IP all agree, and RestLS stops paying a"
+    echo "            round trip to a third party on every single connection."
+    echo "            Needs --cert-mode letsencrypt. Installs nginx."
+    echo "    ${C_BOLD}steal${C_RST} – relay to a third-party site. Their real certificate, but"
+    echo "            your clients then claim their hostname from your IP, and that"
+    echo "            disagreement is exactly what gets scored."
+    ask_choice DECOY_MODE "Camouflage destination" "$DECOY_MODE" auto local steal
+    resolve_decoy_mode
+    if ! _decoy_local; then
+      echo
+      echo "  Pick a busy TLS 1.3 host that is NOT blocked where your clients are,"
+      echo "  and ideally not the same one as the REALITY target."
+      ask_valid STEAL_SNI "Decoy site for the certificate-less layers" "$STEAL_SNI" \
+        valid_domain "must be a hostname, e.g. www.apple.com"
+    fi
+  fi
+
+  # --- link profile ---
+  # These are not cosmetic. mKCP and kcp-tun derive every window and buffer from
+  # them, and because those windows describe the LOCAL side of an asymmetric
+  # path, one set of numbers cannot be right for both ends. Getting the client
+  # uplink wrong is the expensive one: too large and every upload sits in a
+  # multi-second queue that DNS and ACKs then queue behind.
+  if _xport_used mkcp || _xport_used kcptun || _xport_used mekya; then
+    echo
+    echo "  ${C_BOLD}Link profile${C_RST} — mKCP and kcp-tun size their windows from these."
+    echo "  Give the CLIENT's real numbers, not the plan's headline figure, and"
+    echo "  round DOWN. An over-declared uplink does not go faster; it queues."
+    ask_valid CLI_DOWN_MBPS "Typical client DOWNLOAD, Mbit/s" "$CLI_DOWN_MBPS" \
+      valid_mbps "a whole number of Mbit/s, 1..10000"
+    ask_valid CLI_UP_MBPS   "Typical client UPLOAD, Mbit/s"   "$CLI_UP_MBPS" \
+      valid_mbps "a whole number of Mbit/s, 1..10000"
+    ask_valid PATH_RTT_MS   "Round-trip time to the clients, ms" "$PATH_RTT_MS" \
+      valid_ms "a whole number of milliseconds, 1..2000"
+    validate_tunables
+    printf '    -> %s packets in flight downstream, %s upstream (at mtu %s, tti %s)\n' \
+      "$(_pkts_down)" "$(_pkts_up)" "$KCP_MTU" "$MKCP_TTI"
   fi
 
   ask_valid LISTEN_ADDR "Address the listeners bind ('::' = dual-stack)" "$LISTEN_ADDR" \
@@ -920,7 +1337,15 @@ collect_config() {
   printf '  %-24s %s\n' "Bind address"    "$LISTEN_ADDR"
   needs_any_cert && printf '  %-24s %s\n' "TLS certificate" "$CERT_MODE"
   [[ $has_reality == yes ]] && printf '  %-24s %s\n' "REALITY SNI" "$REALITY_SNI"
-  uses_steal_site && printf '  %-24s %s\n' "Decoy site" "$STEAL_SNI"
+  uses_decoy && printf '  %-24s %s\n' "Camouflage decoy" \
+    "$(_decoy_local && echo "local nginx (${VPN_DOMAIN})" || echo "${STEAL_SNI}:443")"
+  if _xport_used mkcp || _xport_used kcptun || _xport_used mekya; then
+    printf '  %-24s %s\n' "Link profile" \
+      "client ${CLI_DOWN_MBPS}/${CLI_UP_MBPS} Mbit/s down/up, ${PATH_RTT_MS} ms RTT"
+    printf '  %-24s %s\n' "KCP windows" \
+      "$(_pkts_down)/$(_pkts_up) pkt down/up, mtu ${KCP_MTU}, tti ${MKCP_TTI}"
+  fi
+  printf '  %-24s %s\n' "TCP Brutal"      "$BRUTAL"
   printf '  %-24s %s\n' "Firewall"        "$FIREWALL"
   printf '  %-24s %s\n' "Kernel tuning"   "$KERNEL_TUNING"
   hr
@@ -1239,6 +1664,9 @@ gen_credentials() {
   [[ -n $GRPC_SVC ]]   || GRPC_SVC="$(gen_hex 5)"
   [[ -n $XHTTP_PATH ]] || XHTTP_PATH="/$(gen_hex 6)"
   [[ -n $MKCP_SEED ]]  || MKCP_SEED="$(gen_hex 8)"
+  # NOT the decoy: simple-obfs does not relay anywhere, so this string is the
+  # entire disguise. As the Host: header of obfs-http and the SNI of obfs-tls it
+  # has to name a plausible third party; your own domain would announce the node.
   [[ -n $OBFS_HOST ]]  || OBFS_HOST="$STEAL_SNI"
   [[ -n $API_SECRET ]] || API_SECRET="$(gen_pass)"
 
@@ -1254,8 +1682,22 @@ gen_credentials() {
   _base_used realm      && { [[ -n $REALM_TOKEN ]] || REALM_TOKEN="$(gen_pass)"; }
   selected_has hysteria2-obfs && { [[ -n $HY2_OBFS_PASSWORD ]] || HY2_OBFS_PASSWORD="$(gen_pass)"; }
 
+  # kcp-tun gets its OWN key. Sharing $PASSWORD across trojan, anytls, hysteria2
+  # and kcp-tun means one leaked node config compromises four protocols at once.
+  _xport_used kcptun && { [[ -n $KCPTUN_KEY ]] || KCPTUN_KEY="$(gen_pass)"; }
+
   _sec_used shadowtls && { [[ -n $SHADOWTLS_PASSWORD ]] || SHADOWTLS_PASSWORD="$(gen_pass)"; }
-  _sec_used restls    && { [[ -n $RESTLS_PASSWORD ]] || RESTLS_PASSWORD="$(gen_pass)"; }
+  if _sec_used restls; then
+    [[ -n $RESTLS_PASSWORD ]] || RESTLS_PASSWORD="$(gen_pass)"
+    # Two independent programmes: the server's shapes server->client records,
+    # the client's shapes client->server. Generated once and kept in state so
+    # they stay stable across regen-sub — a script that changed on every rebuild
+    # would make each client bundle its own distinguishable variant.
+    [[ -n $RESTLS_SCRIPT_S ]] || RESTLS_SCRIPT_S="$(gen_restls_script server)"
+    [[ -n $RESTLS_SCRIPT_C ]] || RESTLS_SCRIPT_C="$(gen_restls_script client)"
+    valid_restls_script "$RESTLS_SCRIPT_S" || die "Invalid server restls script: ${RESTLS_SCRIPT_S}"
+    valid_restls_script "$RESTLS_SCRIPT_C" || die "Invalid client restls script: ${RESTLS_SCRIPT_C}"
+  fi
   if _sec_used jls || _base_used shadowquic; then
     [[ -n $JLS_USER ]]     || JLS_USER="u$(gen_hex 3)"
     [[ -n $JLS_PASSWORD ]] || JLS_PASSWORD="$(gen_pass)"
@@ -1387,6 +1829,258 @@ setup_cert() {
 }
 
 # -----------------------------------------------------------------------------
+# 9a. Camouflage destination
+#
+# ShadowTLS, RestLS and JLS all relay an unauthenticated peer to a real TLS
+# server so that a prober sees that server rather than a proxy. WHICH server is
+# the interesting choice.
+#
+#   steal — a third-party site (${STEAL_SNI}). The disguise is somebody else's
+#           real certificate, but the client then presents that hostname to an
+#           IP that demonstrably is not theirs, and the SNI/IP disagreement is
+#           itself scored. RestLS additionally dials dest before reading a single
+#           client byte and, in mihomo, holds that socket open for the whole
+#           session — so every proxied connection is one live connection to the
+#           decoy, your TLS handshake completes one decoy-RTT later than your TCP
+#           handshake did, and that timing gap is visible to an active prober.
+#
+#   local — a TLS 1.3 site on loopback serving YOUR domain's real certificate.
+#           SNI, certificate and IP all agree, the extra round trip disappears,
+#           and the held-open sockets are loopback. The honest cost: you are no
+#           longer impersonating a large site, you are a small site — so the
+#           decoy has to be worth looking at, which is why a page is generated
+#           rather than leaving nginx's default welcome screen in place.
+#
+# `local` needs a certificate a stranger can verify, so it requires
+# --cert-mode letsencrypt; `auto` picks it when that is available.
+# -----------------------------------------------------------------------------
+_decoy_local() { [[ $DECOY_RESOLVED == local ]]; }
+
+# Does anything selected actually relay to a decoy?
+uses_decoy() {
+  local k
+  for k in $SELECTED; do
+    case "${K_SEC[$k]}" in shadowtls|restls|jls|tlsmirror) return 0 ;; esac
+  done
+  return 1
+}
+
+# host:port the SERVER relays unauthenticated peers to.
+_decoy_dest() {
+  if _decoy_local; then printf '127.0.0.1:%s' "$DECOY_PORT"
+  else printf '%s:443' "$STEAL_SNI"; fi
+}
+# The hostname the CLIENT presents, and that the decoy's certificate must cover.
+_decoy_sni() {
+  if _decoy_local; then printf '%s' "$VPN_DOMAIN"
+  else printf '%s' "$STEAL_SNI"; fi
+}
+
+resolve_decoy_mode() {
+  case "$DECOY_MODE" in
+    local)
+      if [[ $CERT_MODE != letsencrypt ]]; then
+        warn "--decoy local needs a publicly verifiable certificate; falling back to the ${STEAL_SNI} decoy."
+        DECOY_RESOLVED="steal"
+      else
+        DECOY_RESOLVED="local"
+      fi ;;
+    steal) DECOY_RESOLVED="steal" ;;
+    auto|*)
+      # `auto` deliberately resolves to STEAL, not local, even where local would
+      # work. Local is better against SNI/IP-mismatch scoring, but it is a
+      # different bet, not a strictly better one: every borrowed-identity layer
+      # then presents YOUR domain, so one blocklist entry against a name that is
+      # already public in the CT logs takes out ShadowTLS, RestLS and JLS
+      # together — whereas a large third party's name is not realistically
+      # blockable. Choosing that trade is the operator's call, so it is opt-in.
+      DECOY_RESOLVED="steal" ;;
+  esac
+  return 0
+}
+
+# Probe what the decoy actually negotiates, and make the config say that rather
+# than assume it. version-hint is a CLIENT-ONLY key with no default — an absent
+# or wrong value is a hard error in NewRestlsConfig, not a fallback — and JLS's
+# server-side alpn has to intersect what the client offers or the server sends
+# alertNoApplicationProtocol, which counts as having written to the client and
+# therefore disables the fallback path entirely.
+probe_decoy() {
+  local host=$1 port=$2 out=""
+  have openssl || { warn "openssl missing; keeping version-hint=${RESTLS_VERSION_HINT}, alpn=${DECOY_ALPN}."; return 0; }
+  out="$(printf '' | timeout 12 openssl s_client -connect "${host}:${port}" -servername "$(_decoy_sni)" \
+          -alpn h2,http/1.1 -tls1_3 2>/dev/null || true)"
+  if [[ $out == *"Protocol"*"TLSv1.3"* || $out == *"TLSv1.3"* ]]; then
+    RESTLS_VERSION_HINT="tls13"
+    ok "Decoy ${host}:${port} negotiates TLS 1.3."
+  else
+    out="$(printf '' | timeout 12 openssl s_client -connect "${host}:${port}" -servername "$(_decoy_sni)" \
+            -alpn h2,http/1.1 2>/dev/null || true)"
+    if [[ -z $out ]]; then
+      bad "Decoy ${host}:${port} did not answer a TLS handshake at all."
+      bad "RestLS and JLS relay every unauthenticated peer there; with it down the disguise fails open."
+      return 1
+    fi
+    RESTLS_VERSION_HINT="tls12"
+    warn "Decoy ${host}:${port} does NOT do TLS 1.3 — version-hint set to tls12."
+    warn "A TLS 1.2 decoy is a weaker disguise; prefer --decoy local or a TLS 1.3 --steal-sni."
+  fi
+  local a; a="$(printf '%s' "$out" | sed -n 's/^ *ALPN protocol: *//p' | head -1 | tr -d "\r")"
+  case "$a" in
+    h2)         DECOY_ALPN="h2,http/1.1" ;;   # h2 chosen from our offer; both are served
+    http/1.1)   DECOY_ALPN="http/1.1" ;;
+    "")         warn "Decoy negotiated no ALPN; leaving jls-config alpn at ${DECOY_ALPN}." ;;
+    *)          DECOY_ALPN="$a" ;;
+  esac
+  return 0
+}
+
+# A loopback TLS 1.3 site serving the real certificate for VPN_DOMAIN.
+#
+# The four non-obvious settings all come from how RestLS and JLS consume this:
+#   ssl_session_tickets off  — NewSessionTicket records are counted as part of
+#       the server flight and CONSUME RestLS script lines, so a dest that emits
+#       a varying number of tickets shifts your script alignment per connection.
+#   ssl_ecdh_curve X25519:...— both RestLS and JLS reject a HelloRetryRequest
+#       outright, so the curve the browser fingerprint puts its first key_share
+#       on has to be acceptable on the first try.
+#   TLSv1.2 TLSv1.3          — 1.3 for the normal path, 1.2 kept so an old prober
+#       gets a real answer rather than an alert no real site would send.
+#   no listen on :80         — certbot renews standalone on port 80 and nginx
+#       must not be holding it.
+setup_decoy() {
+  # mihomo.service and nginx.service share the same start gate
+  # (After=network-online.target nss-lookup.target) and nothing orders them, so
+  # on boot mihomo can bind and start relaying failed probes to a decoy that is
+  # not listening yet. Written from here rather than install_unit because only
+  # this function knows whether the local decoy actually came up.
+  rm -f "$DECOY_UNIT_DROPIN"
+  _decoy_local || { log "Camouflage decoy: ${STEAL_SNI}:443 (external)."; systemctl daemon-reload >/dev/null 2>&1 || true; return 0; }
+  head1 "Local camouflage decoy (127.0.0.1:${DECOY_PORT})"
+
+  apt-get install -y -qq nginx >/dev/null 2>&1 || {
+    warn "Could not install nginx; falling back to the ${STEAL_SNI} decoy."
+    DECOY_RESOLVED="steal"; rm -f "$DECOY_UNIT_DROPIN"; return 0
+  }
+
+  install -d -m 0755 "$DECOY_ROOT"
+  # Every prober that fails authentication is relayed here, so this page IS the
+  # disguise. A fixed template would be worse than useless: identical bytes on
+  # every deployment of this script is a cross-deployment signature that
+  # identifies the tool itself, and finding one node would then find the rest.
+  # So the wording, the layout and the padding are all drawn per deployment.
+  if [[ ! -s ${DECOY_ROOT}/index.html ]]; then
+    local _h _p _f _pad _n
+    local -a _heads=("Service status" "${VPN_DOMAIN}" "API endpoint" "Internal service"
+                     "Status" "${VPN_DOMAIN%%.*}" "Host information")
+    local -a _paras=(
+      "This host exposes a small number of authenticated HTTP endpoints. There is no public index."
+      "Access to this service requires credentials. Unrecognised paths return this page."
+      "This endpoint is not intended for interactive use. Refer to the service documentation."
+      "No public content is served from this address. Requests without a valid route land here."
+      "Automated clients only. Human traffic is not expected on this host."
+    )
+    local -a _foots=("" "<p><code>${VPN_DOMAIN}</code></p>"
+                     "<p><small>${VPN_DOMAIN}</small></p>" "<hr><p><small>${VPN_DOMAIN}</small></p>")
+    _h="${_heads[RANDOM % ${#_heads[@]}]}"
+    _p="${_paras[RANDOM % ${#_paras[@]}]}"
+    _f="${_foots[RANDOM % ${#_foots[@]}]}"
+    # An HTML comment of random length so the response body length varies too —
+    # the page is delivered over TLS, where length is the observable.
+    _pad=""; _n=$(( 40 + RANDOM % 700 ))
+    _pad="$(head -c "$_n" /dev/urandom | base64 -w0 | tr -d '=+/' )"
+    cat >"${DECOY_ROOT}/index.html" <<EOF
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${_h}</title>
+<style>
+body{margin:0;font:$(( 15 + RANDOM % 3 ))px/1.$(( 4 + RANDOM % 3 )) system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+     padding:$(( 2 + RANDOM % 3 ))rem;max-width:$(( 30 + RANDOM % 14 ))rem;margin:auto}
+h1{font-size:1.$(( 2 + RANDOM % 5 ))rem;margin:0 0 .75rem}
+p{margin:0 0 1rem;opacity:.$(( 7 + RANDOM % 2 ))}
+</style></head>
+<body>
+<h1>${_h}</h1>
+<p>${_p}</p>
+${_f}
+<!-- ${_pad} -->
+</body></html>
+EOF
+  fi
+  chmod 0644 "${DECOY_ROOT}/index.html"
+
+  # `listen ... http2` was replaced by a standalone `http2 on;` in nginx 1.25.1;
+  # emitting the wrong one is a config error, not a warning, so pick by version.
+  local ngver h2line
+  ngver="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9][0-9.]*\).*#\1#p')"
+  if [[ -n $ngver ]] && [[ "$(printf '%s\n1.25.1\n' "$ngver" | sort -V | head -1)" == "1.25.1" ]]; then
+    h2line="    listen 127.0.0.1:${DECOY_PORT} ssl;
+    http2 on;"
+  else
+    h2line="    listen 127.0.0.1:${DECOY_PORT} ssl http2;"
+  fi
+
+  cat >"$DECOY_SITE" <<EOF
+# Generated by Mihomo_Deployment.sh — camouflage decoy for RestLS / JLS / ShadowTLS.
+# Loopback only: this is never reached from the internet directly, only relayed
+# to by mihomo when a peer fails authentication.
+server {
+${h2line}
+    server_name ${VPN_DOMAIN};
+
+    ssl_certificate     ${MH_CERT_FULL};
+    ssl_certificate_key ${MH_CERT_KEY};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve      X25519:prime256v1;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers off;
+
+    root  ${DECOY_ROOT};
+    index index.html;
+    location / { try_files \$uri \$uri/ /index.html; }
+    access_log off;
+}
+EOF
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sf "$DECOY_SITE" "/etc/nginx/sites-enabled/$(basename "$DECOY_SITE")"
+
+  if ! nginx -t >/dev/null 2>&1; then
+    nginx -t 2>&1 | sed 's/^/    /' >&2
+    warn "nginx rejected the decoy site; falling back to the ${STEAL_SNI} decoy."
+    rm -f "/etc/nginx/sites-enabled/$(basename "$DECOY_SITE")" "$DECOY_UNIT_DROPIN"
+    DECOY_RESOLVED="steal"; return 0
+  fi
+  systemctl enable --now nginx >/dev/null 2>&1 || true
+  systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+
+  # The certificate is renewed under mihomo's hook, which knows nothing about
+  # nginx; without this the decoy would keep serving an expired chain to probers.
+  if [[ -s $MH_RENEW_HOOK ]] && ! grep -q 'reload nginx' "$MH_RENEW_HOOK"; then
+    printf 'systemctl reload nginx >/dev/null 2>&1 || true\n' >>"$MH_RENEW_HOOK"
+  fi
+
+  if port_listening tcp "$DECOY_PORT"; then
+    install -d -m 0755 /etc/systemd/system/mihomo.service.d
+    cat >"$DECOY_UNIT_DROPIN" <<'EOF'
+[Unit]
+# The camouflage decoy must be listening before mihomo starts relaying failed
+# probes to it. Written by Mihomo_Deployment.sh only while --decoy local is in
+# effect; removed again if the decoy is turned off.
+After=nginx.service
+Wants=nginx.service
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    ok "Decoy serving ${VPN_DOMAIN} on 127.0.0.1:${DECOY_PORT}."
+  else
+    warn "Nothing is listening on 127.0.0.1:${DECOY_PORT}; falling back to the ${STEAL_SNI} decoy."
+    rm -f "$DECOY_UNIT_DROPIN"
+    DECOY_RESOLVED="steal"
+  fi
+  return 0
+}
+
+# -----------------------------------------------------------------------------
 # 10. mihomo server config
 #
 # NOTES ON THE SCHEMA (all verified against listener/inbound/*.go struct tags):
@@ -1402,6 +2096,219 @@ setup_cert() {
 #  * At most ONE security layer per listener (the core builds a securityModes
 #    slice and hard-errors on more than one) — hence one listener per combination.
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 10a. Window sizing for the two window-based transports
+#
+# mKCP and kcp-tun both size their in-flight window from a number that describes
+# THE LINK OF THE SIDE THAT WRITES IT.  Copying one set of numbers onto both
+# sides is therefore wrong on at least one of them, and the wrong side is always
+# the client: a window meant for a 1 Gbps VPS, applied to a home or mobile
+# uplink, is seconds of standing queue that every DNS lookup and TCP ACK then
+# has to wait behind.
+#
+# Both sides are derived from the same bandwidth-delay product instead:
+#
+#   _bdp_pkts <mbps>   packets that fit in one RTT at that rate, x1.5 headroom
+#   _mkcp_cap <pkts>   the uplink/downlink-capacity value that yields that many
+#   _kcp_buf  <pkts>   a write-buffer that holds two windows and no more
+#
+# _mkcp_cap inverts mihomo's own formula (transport/mkcp/config.go:65-71):
+#
+#   sendingInFlightSize = capacity * 1048576 / mtu / (1000 / tti)
+#
+# so `uplink-capacity` is NOT a link speed — it is a window dial whose product
+# with `tti` sets bytes in flight.  Naming it after a bandwidth is upstream's
+# choice, not a description of what it does, which is exactly why copying a
+# plausible-looking megabyte figure onto both sides goes unnoticed.
+# -----------------------------------------------------------------------------
+# The largest capacity that does not wrap mihomo's uint32 `capacity * 1048576`.
+readonly MKCP_CAP_MAX=4095
+
+_mkcp_ticks() { printf '%s' "$(( 1000 / MKCP_TTI ))"; }
+
+# Packets in flight to keep a link of <mbps> busy over PATH_RTT_MS, x1.5.
+_bdp_pkts() {
+  local mbps=$1 bytes pkts
+  bytes=$(( mbps * 125 * PATH_RTT_MS ))          # mbps*125000 B/s * rtt/1000 s
+  pkts=$(( (bytes * 3 / 2 + KCP_MTU - 1) / KCP_MTU ))
+  (( pkts < 8 )) && pkts=8                       # mihomo's own floor
+  # Sanity ceiling. A 10 Gbit/s profile at 2 s RTT derives ~6.5 million packets,
+  # which becomes a multi-gigabyte write-buffer (overflowing mihomo's uint32
+  # field) and a kcp-go window it would try to allocate up front. Nothing on this
+  # path is that fat; a runaway --rtt-ms or --client-down-mbps is.
+  (( pkts > 65535 )) && pkts=65535
+  printf '%s' "$pkts"
+}
+
+# The uplink-/downlink-capacity value that produces <pkts> in flight.
+_mkcp_cap() {
+  local pkts=$1 ticks cap
+  ticks="$(_mkcp_ticks)"
+  cap=$(( (pkts * KCP_MTU * ticks + 1048575) / 1048576 ))
+  (( cap < 1 )) && cap=1
+  # HARD CEILING, not a style choice. mihomo computes the window as
+  #   size := c.uplinkCapacity() * 1024 * 1024 / c.mtu() / (1000/c.tti())
+  # in uint32 arithmetic, and 4096 * 1048576 is exactly 2^32 — so a capacity of
+  # 4096 wraps the product to 0 and the window collapses to the 8-packet floor,
+  # i.e. the config would look aggressive and run at a crawl. 4095 is the last
+  # value that does not wrap.
+  #
+  # This function is SILENT by design: it is called from inside $( ) in a
+  # heredoc, so anything it writes to stdout is captured straight into the YAML
+  # value. The operator-facing warning lives in validate_tunables, where it also
+  # fires once instead of once per listener per direction.
+  (( cap > MKCP_CAP_MAX )) && cap=$MKCP_CAP_MAX
+  printf '%s' "$cap"
+}
+
+# write-buffer for a <pkts> window.  sendingBufferSize = write-buffer / mtu is
+# the Conn.Write backpressure bound, i.e. how much may queue BEHIND the window;
+# two windows is enough to keep the window full and little enough that the queue
+# cannot dominate latency.  mihomo's 2 MB default is 1553 segments no matter how
+# small the link, which is where the multi-second queue comes from.
+_kcp_buf() {
+  local pkts=$1 b
+  b=$(( pkts * 2 * KCP_MTU ))
+  (( b < 262144 )) && b=262144
+  # Both write-buffer and read-buffer are uint32 in mihomo. 64 MiB is already
+  # four times what upstream's own mekya interop fixture uses, and well clear of
+  # the wrap; beyond it the number is a queue nobody wants anyway.
+  (( b > 67108864 )) && b=67108864
+  printf '%s' "$b"
+}
+
+# kcp-tun window, in packets. Separate from _bdp_pkts because kcp-go sizes real
+# buffers from this: a six-figure window is not an aggressive setting, it is an
+# allocation. 8192 packets is ~9.8 MB in flight at the default MTU, which covers
+# any link this script is plausibly deployed on.
+_kcp_wnd() {
+  local w=$1
+  (( w < 16 ))   && w=16
+  (( w > 8192 )) && w=8192
+  printf '%s' "$w"
+}
+
+# The four windows this deployment actually needs.  A path is only as wide as
+# its narrower end, so each direction is sized from the min of the two links.
+_pkts_down() { _bdp_pkts "$(( SRV_UP_MBPS   < CLI_DOWN_MBPS ? SRV_UP_MBPS   : CLI_DOWN_MBPS ))"; }
+_pkts_up()   { _bdp_pkts "$(( SRV_DOWN_MBPS < CLI_UP_MBPS   ? SRV_DOWN_MBPS : CLI_UP_MBPS   ))"; }
+
+# --- per-variant transport parameters ----------------------------------------
+# mihomo accepts exactly these header names (transport/mkcp/header.go:16-30);
+# anything else silently becomes the no-op header on BOTH sides, which produces
+# a hang rather than an error, so the mapping is closed rather than pass-through.
+# `wireguard` is implemented and deliberately not offered: WireGuard's handshake
+# is itself DPI-classified and throttled on Iranian carriers, so wearing it as a
+# disguise attracts exactly the attention the disguise is meant to avoid.
+_mkcp_header_of() {
+  case "${K_VAR[$1]:-srtp}" in
+    dtls)         printf 'dtls' ;;
+    wechat-video) printf 'wechat-video' ;;
+    utp)          printf 'utp' ;;
+    *)            printf 'srtp' ;;
+  esac
+}
+
+# With congestion on, the configured capacity becomes a CEILING that KCP backs
+# off from under loss.  With it off the window stays wide open and KCP
+# retransmits into the loss, which is where 2-3x wire amplification comes from —
+# see `mihomoctl amplification`.
+_mkcp_cong_of() {
+  case "${K_VAR[$1]:-}" in *nocong*) printf 'false' ;; *) printf 'true' ;; esac
+}
+
+# mode maps to a fixed nodelay/interval/resend/nc tuple and OVERWRITES any
+# explicit values (transport/kcptun/common.go:101-110), so those are never
+# emitted.  `fast` — the upstream default — leaves nodelay at 0; on a lossy path
+# fast2 (nodelay 1, 20 ms) and fast3 (nodelay 1, 10 ms) are what actually cut
+# retransmit latency, at the cost of a higher packet rate.
+_kcptun_mode_of() {
+  case "${K_VAR[$1]:-}" in fast3) printf 'fast3' ;; *) printf 'fast2' ;; esac
+}
+
+# FEC CANNOT BE TURNED OFF in mihomo: FillDefaults rewrites datashard 0 -> 10 and
+# parityshard 0 -> 3 (transport/kcptun/common.go:79-84), so `0/0` does not mean
+# "no FEC", it means "30% overhead". The only real knob is the ratio, and the
+# right ratio is a function of the path's loss rate, not a constant:
+#
+#   loss    ratio    wire overhead   why
+#   <1%     10/1     10%             lowest reachable; ARQ handles the rest
+#   1-3%    10/2     20%             one parity recovers a single loss per block
+#   4-9%    10/3     30%             upstream's default; 10/2 is not enough here
+#   >=10%   20/10    50%             a longer group averages bursts out better
+#                                    than 10/5 at the same overhead
+#
+# Every parity packet is charged against the volume budget that decides how long
+# the IP survives, so over-provisioning FEC is not free insurance — check the
+# real cost with `mihomoctl amplification`.
+_fec_tier() {       # <tier 0..3> -> "<datashard> <parityshard>"
+  case "$1" in
+    0) printf '10 1'  ;;
+    1) printf '10 2'  ;;
+    2) printf '10 3'  ;;
+    *) printf '20 10' ;;
+  esac
+}
+_tier_for_loss() {
+  local l=$1
+  if   (( l >= 10 )); then printf '3'
+  elif (( l >= 4  )); then printf '2'
+  elif (( l >= 1  )); then printf '1'
+  else                     printf '0'; fi
+}
+# The -fec variant sits exactly one tier above the baseline, so the pair is
+# always a meaningful A/B rather than two arbitrary constants. At the top tier
+# there is nothing stronger worth offering, so the two converge.
+_kcptun_fec_of() {
+  local t
+  t="$(_tier_for_loss "$PATH_LOSS_PCT")"
+  [[ ${K_VAR[$1]:-} == fec ]] && t=$(( t + 1 ))
+  (( t > 3 )) && t=3
+  _fec_tier "$t"
+}
+# Split with parameter expansion rather than `read`: _kcptun_fec_of emits no
+# trailing newline, so `read` would hit EOF, return non-zero and trip `set -e`.
+_kcptun_ds_of() { local f; f="$(_kcptun_fec_of "$1")"; printf '%s' "${f%% *}"; }
+_kcptun_ps_of() { local f; f="$(_kcptun_fec_of "$1")"; printf '%s' "${f##* }"; }
+
+# Connection rotation, client side only. A middlebox that kills a flow after
+# 7-35 s costs 100% of throughput when one connection carries everything; with
+# `conn` connections retired every `autoexpire` seconds onto fresh source ports,
+# it costs 1/conn — and because UDP blackholing is keyed on the 4-tuple, the
+# fresh source port is what actually resurrects the path. scavengettl is the
+# drain window for a retired connection and is kept BELOW autoexpire; above it,
+# kcptun warns and retired sessions accumulate.
+_kcptun_rotates()  { [[ ${K_VAR[$1]:-} == rotate ]]; }
+_kcptun_conn_of()  { _kcptun_rotates "$1" && printf '4' || printf '1'; }
+
+# The client opens `conn` INDEPENDENT KCP sessions, each with its own window, so
+# the aggregate in flight is conn x window. Divide the client's windows by conn
+# or rotation quietly multiplies the queue it was supposed to shorten. The
+# server cannot see conn, so its own windows stay whole and the client's smaller
+# advertised window is what clamps the pair.
+_per_conn() {
+  # Split across statements deliberately: under `set -u` bash declares every
+  # name in one `local` as an unset local BEFORE running the assignments, so an
+  # arithmetic expansion in the same statement reads the unset local and aborts.
+  local v=$1 n=$2 r
+  r=$(( (v + n - 1) / n ))
+  (( r < 16 )) && r=16
+  printf '%s' "$r"
+}
+
+# kcptun's own rate limiter, bytes/sec of OUTGOING packets, FEC included.
+# PER KCP SESSION on both sides — the server calls SetRateLimit inside its
+# AcceptKCP loop and the client calls it once per `conn` — so both halves must
+# divide by the connection count or the rotate variant runs at conn x the cap.
+# (kcp-go sess.go: the limiter is consulted in postProcess before tx, and there
+# is no matching check on the input path). Every kcptun mode sets nc=1, i.e. no
+# congestion control at all, so this is the only thing that bounds the send
+# rate — and because it counts FEC and retransmits, it is also the only direct
+# cap on how much wire traffic a byte of payload can turn into.
+_kcp_rate() { local mbps=$1; printf '%s' "$(( mbps * 1000000 / 8 * 9 / 10 ))"; }
+_rate_down() { _kcp_rate "$(( SRV_UP_MBPS   < CLI_DOWN_MBPS ? SRV_UP_MBPS   : CLI_DOWN_MBPS ))"; }
+_rate_up()   { _kcp_rate "$(( SRV_DOWN_MBPS < CLI_UP_MBPS   ? SRV_DOWN_MBPS : CLI_UP_MBPS   ))"; }
+
 _cert_lines() {   # 4-space indented certificate pair
   printf '    certificate: %s\n    private-key: %s\n' "$MH_CERT_FULL" "$MH_CERT_KEY"
 }
@@ -1434,28 +2341,52 @@ EOF
         - name: ${NODE_LABEL}
           password: ${SHADOWTLS_PASSWORD}
       handshake:
-        dest: ${STEAL_SNI}:443
+        dest: $(_decoy_dest)
       strict-mode: true
 EOF
       ;;
     restls)
+      # restls-script is the whole protocol: without it BOTH halves fall back to
+      # the same public default string, and "every deployment emits an identical
+      # record-length sequence" is the fingerprint RestLS exists to remove.
+      # This one is generated per deployment and shaped for THIS direction.
+      #
+      # rate-limit is deliberately left unset (0 = unlimited). It throttles only
+      # the relay a failed prober gets, so any value makes your server serve the
+      # decoy at a capped, unnaturally smooth bitrate the real site does not —
+      # converting a byte-perfect impersonation into a measurable one.
       cat <<EOF
     res-tls:
       enable: true
-      dest: ${STEAL_SNI}:443
+      dest: $(_decoy_dest)
       password: ${RESTLS_PASSWORD}
+      restls-script: "${RESTLS_SCRIPT_S}"
 EOF
+      # 0 means "omit and let the server use its built-in 15": a raised floor
+      # pads every short record to a uniform size, which is its own signature.
+      (( RESTLS_MIN_RECORD_LEN > 0 )) && printf '      min-record-len: %s\n' "$RESTLS_MIN_RECORD_LEN"
       ;;
     jls)
+      # alpn has to intersect what the client's browser fingerprint offers.
+      # ALPN is negotiated AFTER the JLS authentication check, so a mismatch is
+      # not a soft failure: the server sends alertNoApplicationProtocol, which
+      # counts as having written to the client, which disables the relay-to-dest
+      # fallback — an authenticated user gets a dead connection and a prober gets
+      # an alert no real site would send. Probed from the decoy, not assumed.
+      #
+      # rate-limit is left unset for the same reason as res-tls above.
       cat <<EOF
     jls-config:
       enable: true
-      dest: ${STEAL_SNI}:443
-      sni: ${STEAL_SNI}
+      dest: $(_decoy_dest)
+      sni: $(_decoy_sni)
       users:
         - username: ${JLS_USER}
           password: ${JLS_PASSWORD}
+      alpn:
 EOF
+      local _a; local IFS=','
+      for _a in $DECOY_ALPN; do printf '        - %s\n' "$_a"; done
       ;;
     # Retained for hand-editing /etc/mihomo/config.yaml; no catalogue key
     # selects it (see build_catalogue for why).
@@ -1463,7 +2394,7 @@ EOF
       cat <<EOF
     tlsmirror-config:
       primary-key: ${TLSMIRROR_KEY}
-      dest: ${STEAL_SNI}:443
+      dest: $(_decoy_dest)
       transport-layer-padding:
         enabled: true
       sequence-watermarking-enabled: true
@@ -1490,21 +2421,35 @@ EOF
       ;;
     mkcp)
       # mKCP is a UDP transport with no TLS of any kind; `seed` is the shared
-      # obfuscation secret and `header` disguises the packets as SRTP.
+      # obfuscation secret and `header` disguises the packets.
+      #
+      # seed / header / mtu / tti MUST match the client.  The four capacity and
+      # buffer values MUST NOT: uplink-capacity sizes what THIS side may have in
+      # flight, downlink-capacity is the receive window it advertises to the
+      # peer, and the two ends of this path are a 1 Gbps VPS and a handset.
+      # Hence: uplink here is the download direction, downlink here is upload.
+      local dp up
+      dp="$(_pkts_down)"; up="$(_pkts_up)"
       cat <<EOF
     mkcp-config:
       enable: true
       seed: ${MKCP_SEED}
-      header: srtp
-      mtu: 1350
-      tti: 50
-      uplink-capacity: 12
-      downlink-capacity: 100
-      congestion: false
+      header: $(_mkcp_header_of "$key")
+      mtu: ${KCP_MTU}
+      tti: ${MKCP_TTI}
+      uplink-capacity: $(_mkcp_cap "$dp")
+      downlink-capacity: $(_mkcp_cap "$up")
+      congestion: $(_mkcp_cong_of "$key")
+      write-buffer: $(_kcp_buf "$dp")
+      read-buffer: $(_kcp_buf "$up")
 EOF
       ;;
     mekya)
-      # h2-over-KCP inside real TLS. Parameters follow the upstream interop test.
+      # h2-over-KCP inside real TLS. The nested kcp block is the same struct as
+      # mkcp-config, so it is sized the same asymmetric way; the surrounding h2
+      # parameters follow the upstream interop test.
+      local dp up
+      dp="$(_pkts_down)"; up="$(_pkts_up)"
       cat <<EOF
     mekya-config:
       enable: true
@@ -1513,12 +2458,13 @@ EOF
       max-simultaneous-write-connection: 128
       packet-writing-buffer: 65536
       kcp:
-        mtu: 1350
-        tti: 15
-        uplink-capacity: 40
-        downlink-capacity: 2000
-        write-buffer: 67108864
-        read-buffer: 67108864
+        mtu: ${KCP_MTU}
+        tti: ${MKCP_TTI}
+        uplink-capacity: $(_mkcp_cap "$dp")
+        downlink-capacity: $(_mkcp_cap "$up")
+        congestion: true
+        write-buffer: $(_kcp_buf "$dp")
+        read-buffer: $(_kcp_buf "$up")
 EOF
       ;;
     obfs-http|obfs-tls)
@@ -1543,21 +2489,92 @@ EOF
     kcptun)
       # kcp-tun REPLACES the TCP listener with a UDP one, which is why it never
       # appears alongside a security layer here.
+      #
+      # key / crypt / mode / mtu / datashard / parityshard / nocomp must be
+      # IDENTICAL on both sides — a nocomp mismatch in particular corrupts the
+      # stream silently rather than failing.  sndwnd / rcvwnd must not be:
+      # sndwnd is what this side may have in flight, rcvwnd is the window it
+      # advertises, and the effective window is min(sndwnd, peer rcvwnd).
+      #
+      # conn / autoexpire / scavengettl are deliberately absent here.  They
+      # exist in the listener struct but transport/kcptun/server.go never reads
+      # them; only the client half acts on them, so they live in plugin-opts.
+      local dp up
+      dp="$(_pkts_down)"; up="$(_pkts_up)"
       cat <<EOF
     kcp-tun:
       enable: true
-      key: ${PASSWORD}
+      key: ${KCPTUN_KEY}
       crypt: aes-128
-      mode: fast
-      mtu: 1350
-      sndwnd: 1024
-      rcvwnd: 1024
-      datashard: 10
-      parityshard: 3
+      mode: $(_kcptun_mode_of "$key")
+      mtu: ${KCP_MTU}
+      sndwnd: $(_kcp_wnd "$dp")
+      rcvwnd: $(_kcp_wnd "$up")
+      datashard: $(_kcptun_ds_of "$key")
+      parityshard: $(_kcptun_ps_of "$key")
+      nocomp: true
+      ratelimit: $(( $(_rate_down) / $(_kcptun_conn_of "$key") ))
+      sockbuf: 16777216
+      smuxver: 2
+      smuxbuf: 8388608
+      streambuf: 2097152
+      keepalive: 10
+      dscp: 0
 EOF
       ;;
     *) : ;;
   esac
+  return 0
+}
+
+# Does this key carry sing-mux?
+#
+# The LISTENER side accepts `mux-option` on exactly eight inbound types — vmess,
+# vless, trojan, shadowsocks, hysteria2, tuic, shadowquic, sudoku. anytls and
+# snell are NOT among them (anytls has its own native session multiplexing and
+# its listener never routes through the sing handler, so a client `smux` on it
+# is silently never demultiplexed).
+#
+# Of the eight, only the four stream-oriented ones are worth muxing: the QUIC
+# family already multiplexes natively, kcp-tun runs its own smux inside the
+# tunnel, and mkcp/mekya are left alone rather than stacked.
+#
+# The payoff is not throughput — it is connection count. Iranian ISP QoS is
+# reported to bite past roughly 4-8 concurrent connections to one IP, and each
+# new connection is another first-two-packets event for the protocol whitelister
+# to score. Folding many streams onto four connections cuts both.
+_muxable_any() { local k; for k in $SELECTED; do _muxable "$k" && return 0; done; return 1; }
+
+_muxable() {
+  case "${K_BASE[$1]}" in vless|vmess|trojan|ss) : ;; *) return 1 ;; esac
+  case "${K_XPORT[$1]}" in
+    tcp|ws|grpc|xhttp|plain|obfs-http|obfs-tls) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Listener half. The struct has exactly two fields — `padding` and `brutal` —
+# there is no `enabled`, no protocol, no stream counts; the client picks the
+# protocol and announces it, and the server obeys.
+#
+# The mux SERVICE is always active on the eight supported inbound types — there
+# is no on/off switch — so this block is emitted only when it has something to
+# say, i.e. when brutal is enabled.
+#
+# `padding: true` is deliberately NOT set here, even though padding is wanted.
+# On the listener it is an ENFORCEMENT: sing-mux rejects every unpadded mux
+# connection once the server sets it ("non-padded connection rejected"). The
+# generated mihomo YAML pads, but a share link has no field that can express
+# sing-mux padding and neither does the generated sing-box config, so enforcing
+# it server-side turns "this client enabled mux" into a hard, silent failure for
+# everyone outside this script's own YAML. Setting it CLIENT-side instead gets
+# the padding onto the wire anyway — the server honours a padded connection
+# whether or not it demands one — with no way to lock anybody out.
+_mux_listener_block() {
+  _muxable "$1" || return 0
+  [[ $BRUTAL == yes ]] || return 0
+  printf '    mux-option:\n      brutal:\n        enabled: true\n        up: "%s Mbps"\n        down: "%s Mbps"\n' \
+    "$SRV_UP_MBPS" "$SRV_DOWN_MBPS"
   return 0
 }
 
@@ -1576,19 +2593,19 @@ lst_of() {
       if [[ ${K_XPORT[$key]} == tcp && ( ${K_SEC[$key]} == tls || ${K_SEC[$key]} == reality ) ]]; then
         printf '        flow: xtls-rprx-vision\n'
       fi
-      _xport_block "$key"; _sec_block "$key" ;;
+      _xport_block "$key"; _sec_block "$key"; _mux_listener_block "$key" ;;
     vmess)
       printf '    users:\n      - username: %s\n        uuid: %s\n        alterId: 0\n' "$NODE_LABEL" "$UUID"
-      _xport_block "$key"; _sec_block "$key" ;;
+      _xport_block "$key"; _sec_block "$key"; _mux_listener_block "$key" ;;
     trojan)
       printf '    users:\n      - username: %s\n        password: %s\n' "$NODE_LABEL" "$PASSWORD"
-      _xport_block "$key"; _sec_block "$key" ;;
+      _xport_block "$key"; _sec_block "$key"; _mux_listener_block "$key" ;;
     anytls)
       printf '    users:\n      %s: %s\n    padding-scheme: ""\n' "$NODE_LABEL" "$PASSWORD"
       _sec_block "$key" ;;
     ss)
       printf '    password: %s\n    cipher: %s\n    udp: true\n' "$SS_PASSWORD" "$SS_METHOD"
-      _xport_block "$key"; _sec_block "$key" ;;
+      _xport_block "$key"; _sec_block "$key"; _mux_listener_block "$key" ;;
     snell)
       printf '    psk: %s\n    version: %s\n    udp: true\n' "$SNELL_PSK" "$SNELL_VERSION"
       _xport_block "$key"; _sec_block "$key" ;;
@@ -1711,6 +2728,36 @@ kernel_tuning() {
   [[ $KERNEL_TUNING == yes ]] || { log "Kernel tuning skipped."; return 0; }
   head1 "Kernel / sysctl tuning"
 
+  # udp_mem is in PAGES and is meaningless as an absolute number: the kernel's
+  # own default is derived from nr_free_buffer_pages, so a fixed triple either
+  # starves a big host or over-commits a small one. 1/16, 1/8, 1/4 of RAM keeps
+  # the same shape as the kernel's default with headroom for our own listeners,
+  # floored so a tiny VPS still gets a workable budget.
+  local _pages _um_min _um_pres _um_max udp_mem
+  _pages="$(getconf _PHYS_PAGES 2>/dev/null || echo 0)"
+  if [[ $_pages =~ ^[0-9]+$ ]] && (( _pages > 0 )); then
+    _um_min=$(( _pages / 16 )); _um_pres=$(( _pages / 8 )); _um_max=$(( _pages / 4 ))
+  else
+    _um_min=0; _um_pres=0; _um_max=0
+  fi
+  (( _um_min  < 24576 )) && _um_min=24576      # 96 MiB
+  (( _um_pres < 32768 )) && _um_pres=32768     # 128 MiB
+  (( _um_max  < 49152 )) && _um_max=49152      # 192 MiB
+  udp_mem="${_um_min} ${_um_pres} ${_um_max}"
+
+  # TCP Brutal is not a mainline module. sing-mux asks for it per connection and
+  # logs at debug when the setsockopt fails, so its absence is harmless — but
+  # silently harmless, which is worth saying out loud when --brutal was asked for.
+  if [[ $BRUTAL == yes ]]; then
+    modprobe brutal >/dev/null 2>&1 || true
+    if grep -qw brutal /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+      ok "TCP Brutal congestion control available."
+    else
+      warn "--brutal is set but the tcp_brutal kernel module is not present."
+      warn "sing-mux will negotiate brutal and then silently fall back to the system CC."
+    fi
+  fi
+
   local bbr_block=""
   modprobe tcp_bbr >/dev/null 2>&1 || true
   if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
@@ -1744,6 +2791,20 @@ net.core.optmem_max = 65536
 net.ipv4.tcp_rmem = 4096 131072 16777216
 net.ipv4.tcp_wmem = 4096 16384 16777216
 net.ipv4.tcp_moderate_rcvbuf = 1
+
+# UDP memory accounting. rmem_max/wmem_max above are only per-socket CEILINGS;
+# udp_mem is the SYSTEM-WIDE budget, in 4 KiB PAGES, shared by every UDP socket
+# on the box. With mKCP, kcp-tun and three QUIC listeners each asking for
+# multi-megabyte buffers — and the kernel charging double what a socket requests
+# — the global pages are what runs out first, and the symptom is silent drops
+# with nothing in any log. Derived from RAM rather than hard-coded so a 1 GB VPS
+# is not handed a 4 GB ceiling it can never honour.
+net.ipv4.udp_mem = ${udp_mem}
+# Per-socket floors that survive a pressure event. The usual 16384 is about a
+# millisecond of a 100 Mbps flow — far too little to keep a flow alive once the
+# system-wide accounting tightens.
+net.ipv4.udp_rmem_min = 262144
+net.ipv4.udp_wmem_min = 262144
 
 # Queues / backlogs for many concurrent connections.
 net.core.somaxconn = 8192
@@ -1880,6 +2941,292 @@ firewall_setup() {
 }
 
 # -----------------------------------------------------------------------------
+# 12a. Wire-amplification metering
+#
+# `check` answers "is the port bound", which is the wrong question for this
+# deployment. The number that decides how many days an IP survives is
+#
+#     bytes actually put on the wire  /  bytes of payload delivered
+#
+# because the graylist that matters here is volume-driven — Iranian testers
+# report blocks after roughly 40 GB in two hours, and under 100 GB cumulative on
+# a normally-loaded node. Every retransmit, every FEC parity packet and every
+# padding record is charged against that budget, so a transport running at 2x
+# amplification is spending a third of the budget on nothing.
+#
+# Nothing in mihomo reports this: its own counters are payload. So the wire side
+# is counted by the kernel (nftables byte counters on each listener port) and
+# divided by mihomo's payload totals from the RESTful API.
+#
+# Chain priority -300 puts these counters ahead of any filter/NAT rules, so they
+# see traffic the firewall may later drop — which is what you want, since a
+# dropped packet still crossed the wire and still counts.
+# -----------------------------------------------------------------------------
+readonly METER_TABLE="mihomo_meter"
+readonly METER_BASE="${STATE_DIR}/meter.base"
+
+_meter_available() { have nft; }
+
+setup_metering() {
+  [[ $METERING == yes ]] || { log "Wire-amplification metering skipped."; return 0; }
+  if ! _meter_available; then
+    apt-get install -y -qq nftables >/dev/null 2>&1 || true
+  fi
+  if ! _meter_available; then
+    warn "nft not available; \`mihomoctl amplification\` will have no wire counters."
+    return 0
+  fi
+  head1 "Wire-amplification counters"
+
+  local key p l4 counters="" inrules="" outrules="" n=0
+  for key in $SELECTED; do
+    p="${PORT[$key]:-}"; [[ -n $p ]] || continue
+    l4="$(proto_l4 "$key")"
+    case "$l4" in
+      udp|both)
+        counters+="  counter u${p}_in { }"$'\n'"  counter u${p}_out { }"$'\n'
+        inrules+="    udp dport ${p} counter name u${p}_in"$'\n'
+        outrules+="    udp sport ${p} counter name u${p}_out"$'\n'
+        n=$((n+1)) ;;
+    esac
+    case "$l4" in
+      tcp|both)
+        counters+="  counter t${p}_in { }"$'\n'"  counter t${p}_out { }"$'\n'
+        inrules+="    tcp dport ${p} counter name t${p}_in"$'\n'
+        outrules+="    tcp sport ${p} counter name t${p}_out"$'\n'
+        n=$((n+1)) ;;
+    esac
+  done
+  (( n > 0 )) || { log "No listener ports to meter."; return 0; }
+
+  nft delete table inet "$METER_TABLE" >/dev/null 2>&1 || true
+  if ! nft -f - <<EOF >/dev/null 2>&1
+table inet ${METER_TABLE} {
+${counters}  chain meter_in {
+    type filter hook input priority -300; policy accept;
+${inrules}  }
+  chain meter_out {
+    type filter hook output priority -300; policy accept;
+${outrules}  }
+}
+EOF
+  then
+    warn "nftables rejected the counter table; metering disabled for this run."
+    return 0
+  fi
+  ok "Metering ${n} counter pair(s); read them with \`mihomoctl amplification\`."
+  return 0
+}
+
+# mihomo's totals are cumulative since the process started, and the nft counters
+# are cumulative since they were created. A ratio between two differently-based
+# running totals is meaningless, so the API totals are snapshotted whenever the
+# counters are zeroed and the delta is what gets divided.
+_api_totals() {   # -> "<up> <down>" or empty
+  local host secret out
+  [[ -n $API_LISTEN ]] || return 1
+  host="$API_LISTEN"; [[ $host == :* ]] && host="127.0.0.1${host}"
+  out="$(curl -fsS --max-time 4 -H "Authorization: Bearer ${API_SECRET}" \
+        "http://${host}/connections" 2>/dev/null || true)"
+  [[ -n $out ]] || return 1
+  printf '%s' "$out" | jq -r '"\(.uploadTotal // 0) \(.downloadTotal // 0)"' 2>/dev/null
+}
+
+_meter_baseline() {
+  local t; t="$(_api_totals || true)"
+  install -d -m 0700 "$STATE_DIR"
+  { printf '%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; printf '%s\n' "${t:-0 0}"; } >"$METER_BASE"
+  chmod 0600 "$METER_BASE"
+  return 0
+}
+
+_human() {  # bytes -> human
+  local b=$1
+  if   (( b >= 1099511627776 )); then printf '%d.%02d TiB' $(( b / 1099511627776 )) $(( b % 1099511627776 * 100 / 1099511627776 ))
+  elif (( b >= 1073741824 ));    then printf '%d.%02d GiB' $(( b / 1073741824 ))    $(( b % 1073741824 * 100 / 1073741824 ))
+  elif (( b >= 1048576 ));       then printf '%d.%02d MiB' $(( b / 1048576 ))       $(( b % 1048576 * 100 / 1048576 ))
+  elif (( b >= 1024 ));          then printf '%d.%02d KiB' $(( b / 1024 ))          $(( b % 1024 * 100 / 1024 ))
+  else printf '%d B' "$b"; fi
+}
+
+do_amplification() {
+  if [[ ${1:-} == --reset ]]; then
+    _meter_available || die "nft is not installed; nothing to reset."
+    nft reset counters table inet "$METER_TABLE" >/dev/null 2>&1 \
+      || die "No counter table — run a deploy, or 'mihomoctl check' to confirm setup."
+    _meter_baseline
+    ok "Counters zeroed and the payload baseline re-snapshotted."
+    return 0
+  fi
+
+  _meter_available || die "nft is not installed, so there are no wire counters to read."
+  local js; js="$(nft -j list counters table inet "$METER_TABLE" 2>/dev/null || true)"
+  [[ -n $js ]] || die "No counter table found. Re-run a deploy, or drop --no-metering."
+
+  head1 "Wire bytes per listener port"
+  printf '  %-30s %-6s %14s %14s\n' "key" "l4" "in" "out"
+  local key p l4 cin cout wire_in=0 wire_out=0 v
+  for key in $SELECTED; do
+    p="${PORT[$key]:-}"; [[ -n $p ]] || continue
+    l4="$(proto_l4 "$key")"
+    local pfx; case "$l4" in udp) pfx=u ;; tcp) pfx=t ;; both) pfx=both ;; *) continue ;; esac
+    if [[ $pfx == both ]]; then
+      cin=$(( $(_ctr "$js" "t${p}_in")  + $(_ctr "$js" "u${p}_in")  ))
+      cout=$(( $(_ctr "$js" "t${p}_out") + $(_ctr "$js" "u${p}_out") ))
+    else
+      cin="$(_ctr "$js" "${pfx}${p}_in")"; cout="$(_ctr "$js" "${pfx}${p}_out")"
+    fi
+    wire_in=$(( wire_in + cin )); wire_out=$(( wire_out + cout ))
+    (( cin == 0 && cout == 0 )) && continue
+    printf '  %-30s %-6s %14s %14s\n' "$key" "$l4" "$(_human "$cin")" "$(_human "$cout")"
+  done
+  hr
+  local wire=$(( wire_in + wire_out ))
+  printf '  %-30s %s\n' "wire total (in+out)" "$(_human "$wire")"
+
+  # Payload delta against the baseline taken when the counters were last zeroed.
+  local base_up=0 base_dn=0 since="unknown" now up=0 dn=0
+  if [[ -r $METER_BASE ]]; then
+    since="$(sed -n 1p "$METER_BASE")"
+    # `|| ...` because `read` returns non-zero at EOF, so a truncated or empty
+    # baseline would abort the whole command under `set -e` instead of just
+    # losing the payload half of the report.
+    read -r base_up base_dn < <(sed -n 2p "$METER_BASE") || { base_up=0; base_dn=0; }
+    [[ -n $since ]] || since="unknown"
+  fi
+  now="$(_api_totals || true)"
+  if [[ -n $now ]]; then
+    read -r up dn <<<"$now"
+    # mihomo restarting resets its own totals below the baseline; treat that as
+    # "the baseline is stale" rather than printing a negative payload.
+    local stale=no
+    if (( up < base_up || dn < base_dn )); then
+      # mihomo's totals are cumulative per PROCESS. If they have gone backwards
+      # the process restarted, and the wire counters — which did not — now cover
+      # a strictly longer window. Dividing the two would understate amplification
+      # by an unknown factor, so the ratio is withheld rather than guessed at.
+      stale=yes
+    else
+      up=$(( up - base_up )); dn=$(( dn - base_dn ))
+    fi
+    local payload=$(( up + dn ))
+    if [[ $stale == yes ]]; then
+      printf '  %-30s %s  (raw total — baseline is stale)\n' "payload delivered" "$(_human "$payload")"
+    else
+      printf '  %-30s %s\n' "payload delivered" "$(_human "$payload")"
+    fi
+    printf '  %-30s %s\n' "measuring since" "$since"
+    if [[ $stale == yes ]]; then
+      warn "mihomo's payload counters restarted since the baseline, so the two sides"
+      warn "cover different windows and the ratio would be meaningless."
+      warn "Re-base both with: mihomoctl amplification --reset"
+    elif (( payload > 0 )); then
+      hr
+      printf '  %-30s %d.%02dx\n' "AMPLIFICATION" $(( wire / payload )) $(( wire % payload * 100 / payload ))
+      echo
+      echo "  Below ~1.15x is normal overhead. Above ~1.5x something is paying for"
+      echo "  itself in retransmits or FEC — the usual causes are congestion: false"
+      echo "  on a lossy mkcp node and a parityshard ratio larger than the path"
+      echo "  needs. Compare the per-port rows above against their variants:"
+      echo "  vmess-mkcp vs vmess-mkcp-nocong, ss-kcptun vs ss-kcptun-fec."
+    else
+      warn "mihomo reports no payload since the baseline; ratio not computed."
+    fi
+  else
+    warn "Could not read mihomo's API (${API_LISTEN:-disabled}); wire bytes only."
+  fi
+
+  # The budget that actually decides how long the IP lives.
+  hr
+  local hrs=0
+  if [[ $since != unknown ]] && have date; then
+    local t0 t1; t0="$(date -u -d "$since" +%s 2>/dev/null || echo 0)"; t1="$(date -u +%s)"
+    (( t0 > 0 )) && hrs=$(( (t1 - t0 + 1799) / 3600 ))
+  fi
+  if (( hrs > 0 )); then
+    # Integer division on GiB rounds a 900 MiB/h node to "0 GiB/h", which reads
+    # as "nothing is happening" — divide first, humanise second.
+    local gbh
+    gbh=$(( wire / hrs ))
+    printf '  %-30s ~%s/h over %d h\n' "wire rate" "$(_human "$gbh")" "$hrs"
+    gbh=$(( gbh / 1073741824 ))
+    if (( gbh >= 15 )); then
+      warn "At/above the ~15-20 GiB/h band where volume graylisting has been reported."
+      warn "Shard users across more IPs rather than tuning — this is a detection limit, not a capacity one."
+    fi
+  fi
+  return 0
+}
+
+# Measure the largest UDP datagram that survives to a target, by binary search
+# on the don't-fragment bit.
+#
+# This exists because the sysctl drop-in sets net.ipv4.tcp_mtu_probing=1 and
+# nothing at all measures the UDP path — and a KCP packet that fragments is lost
+# outright when either fragment is dropped, so an over-large --kcp-mtu is a
+# latency and loss problem, not an efficiency one.
+#
+# Two honest limitations, stated up front rather than buried:
+#   * It measures THIS server's path to the target. Run it against a real client
+#     address to learn something about a real client's path; run it against
+#     anything else and you have measured a different path.
+#   * It probes with ICMP, and ICMP is heavily filtered on exactly the networks
+#     this matters for. A failure at every size means "no answer", not "MTU is
+#     tiny" — which is also why PMTU discovery cannot be relied on there and why
+#     the default is a conservative constant instead of a discovered value.
+#
+# ICMP payload P puts P+28 bytes on the wire (8 ICMP + 20 IP). A UDP datagram
+# carrying a KCP packet of `mtu` bytes puts mtu+28 on the wire (8 UDP + 20 IP).
+# The overheads match, so the largest working P is directly the largest safe
+# --kcp-mtu.
+do_pmtu() {
+  local target=${1:-}
+  [[ -n $target ]] || die "usage: mihomoctl pmtu <client-ip-or-host>"
+  have ping || die "ping is not installed."
+  head1 "UDP path MTU probe -> ${target}"
+
+  local lo=500 hi=1472 mid best=0
+  # Confirm the target answers at all before reading silence as a small MTU.
+  if ! ping -c 2 -W 2 -n "$target" >/dev/null 2>&1; then
+    bad "${target} does not answer ICMP at all — this probe cannot tell you anything."
+    bad "That is itself common on Iranian carriers; keep the conservative --kcp-mtu default."
+    return 1
+  fi
+  while (( lo <= hi )); do
+    mid=$(( (lo + hi) / 2 ))
+    if ping -c 1 -W 2 -n -M do -s "$mid" "$target" >/dev/null 2>&1; then
+      best=$mid; lo=$(( mid + 1 ))
+    else
+      hi=$(( mid - 1 ))
+    fi
+  done
+
+  if (( best == 0 )); then
+    bad "No DF-bit probe got through at any size; the path drops them or filters the reply."
+    return 1
+  fi
+  ok "Largest unfragmented payload: ${best} bytes  (path MTU $(( best + 28 )))"
+  printf '  %-30s %s\n' "safe --kcp-mtu" "$best"
+  printf '  %-30s %s\n' "currently configured"  "$KCP_MTU"
+  if (( KCP_MTU > best )); then
+    warn "--kcp-mtu ${KCP_MTU} exceeds this path's ${best}: every KCP packet fragments,"
+    warn "and losing either fragment loses the whole packet. Re-deploy with --kcp-mtu ${best}."
+  else
+    ok "The configured --kcp-mtu fits this path with $(( best - KCP_MTU )) bytes to spare."
+  fi
+  return 0
+}
+
+# Pull one counter's byte total out of `nft -j list counters` output.
+_ctr() {
+  local js=$1 name=$2 v
+  v="$(printf '%s' "$js" | jq -r --arg n "$name" \
+        '[.nftables[]?.counter? | select(.name == $n) | .bytes] | first // 0' 2>/dev/null || echo 0)"
+  [[ $v =~ ^[0-9]+$ ]] || v=0
+  printf '%s' "$v"
+}
+
+# -----------------------------------------------------------------------------
 # 13. Services
 # -----------------------------------------------------------------------------
 start_services() {
@@ -1917,23 +3264,89 @@ start_services() {
 # wider client ecosystem actually parses; everything else is YAML-only and says
 # so in README.txt rather than emitting a link no client can import.
 # -----------------------------------------------------------------------------
-# ALPN a given transport should advertise. WebSocket speaks HTTP/1.1 only, so
-# advertising h2 there invites a client or CDN to break the Upgrade handshake.
+# ALPN a given transport should advertise, for the share links and the sing-box
+# config. WebSocket speaks HTTP/1.1 only, so advertising h2 there invites a
+# client or CDN to break the Upgrade handshake.
+#
+# Everything else gets the BROWSER'S list rather than the transport-minimal one.
+# gRPC and XHTTP need h2 and used to say so alone, but a lone `h2` is a list no
+# browser sends, and the server still selects h2 from ["h2","http/1.1"] by
+# preference order — so the minimal form bought nothing and cost a distinguisher.
+# Keeping this in step with _cli_alpn also means one node no longer advertises
+# three different ALPN lists depending on which artefact the user imported.
 _alpn_of() {
   case "${K_XPORT[$1]}" in
-    ws)          echo "http/1.1" ;;
-    grpc|xhttp)  echo "h2" ;;
-    *)           echo "h2,http/1.1" ;;
+    ws) echo "http/1.1" ;;
+    *)  echo "h2,http/1.1" ;;
   esac
 }
 
 # The SNI a client must present: the decoy for the borrowed-identity layers,
 # your own domain for a real certificate.
+# The decoy's negotiated ALPN as an inline YAML flow list: ["h2","http/1.1"].
+# Used by the shadowsocks and snell plugin paths, whose alpn key sits inside a
+# flow mapping rather than a block one.
+_alpn_yaml_inline() {
+  local a out=() IFS=','
+  for a in $DECOY_ALPN; do out+=("\"$a\""); done
+  IFS=','; printf '%s' "${out[*]}"
+}
+
+# ALPN for a client proxy entry.
+#
+# The review this implements asked for `alpn:` on every node, on the grounds that
+# the YAML advertises none while the share links do. Reading the source says the
+# premise is wrong, and the correction matters more than the fix:
+#
+#   EVERY node here sets `client-fingerprint: chrome`, so the ClientHello is
+#   built by uTLS from the Chrome parrot template — and that template's ALPN
+#   extension is what goes on the wire. mihomo proves this itself: the only way
+#   it can force http/1.1 for WebSocket is BuildWebsocketHandshakeState, which
+#   walks conn.Extensions and rewrites the ALPNExtension by hand after the
+#   handshake state is built. If NextProtos were enough, that function would not
+#   need to exist. So these nodes were never advertising "no ALPN" — they were
+#   advertising Chrome's, which is what you want.
+#
+# What `alpn:` actually reaches, per transport/vmess/tls.go:
+#   REALITY    — nothing. GetRealityConn is called without the tls.Config at all.
+#   ShadowTLS  — already defaults to exactly ["h2","http/1.1"] when unset.
+#   JLS        — the proxy-level alpn IS passed to jls.NewClient, and a non-nil
+#                value calls overrideUTLSALPN, which rewrites the ALPN extension
+#                inside an otherwise pristine Chrome ClientHello AND drops the
+#                ApplicationSettings extension when h2 is absent. Setting it can
+#                only make the fingerprint worse; leaving it unset keeps
+#                Chrome's own list. JLS nodes therefore get nothing.
+#   tls/restls — reaches NextProtos, which the non-uTLS path and RestLS's own
+#                config do consume.
+#
+# So the value emitted is the BROWSER'S list, not `_alpn_of`'s transport-minimal
+# one: `h2` alone would be a novel fingerprint if it ever did reach the wire,
+# while ["h2","http/1.1"] is what the template sends anyway and the server still
+# selects h2 for grpc/xhttp by preference order. WebSocket is the one exception —
+# an h2 selection there breaks the Upgrade, and http/1.1 alone is what mihomo
+# forces on that path regardless.
+#
+# Net effect: on a client-fingerprint node this is a no-op that documents intent;
+# on a node with the fingerprint disabled it is the correct value. It is never a
+# new signature, which is the only property that mattered.
+_cli_alpn() {
+  case "${K_SEC[$1]}" in
+    tls|restls) : ;;
+    *) return 0 ;;
+  esac
+  case "${K_XPORT[$1]}" in
+    mkcp|mekya) return 0 ;;   # no TLS layer / mekya forces its own
+    ws)         printf '    alpn:\n      - http/1.1\n' ;;
+    *)          printf '    alpn:\n      - h2\n      - http/1.1\n' ;;
+  esac
+  return 0
+}
+
 _cli_sni() {
   case "${K_SEC[$1]}" in
-    reality)                     printf '%s' "$REALITY_SNI" ;;
-    shadowtls|restls|jls|tlsmirror) printf '%s' "$STEAL_SNI" ;;
-    *)                           printf '%s' "$VPN_DOMAIN" ;;
+    reality)                        printf '%s' "$REALITY_SNI" ;;
+    shadowtls|restls|jls|tlsmirror) _decoy_sni ;;
+    *)                              printf '%s' "$VPN_DOMAIN" ;;
   esac
 }
 
@@ -1961,6 +3374,7 @@ _cli_sec() {
   case "${K_SEC[$key]}" in
     tls)
       printf '    tls: true\n    servername: %s\n    skip-cert-verify: %s\n' "$sni" "$sci"
+      _cli_alpn "$key"
       [[ $CERT_MODE == self && -n $CERT_PIN ]] && printf '    fingerprint: %s\n' "$CERT_PIN" ;;
     reality)
       cat <<EOF
@@ -1981,12 +3395,20 @@ EOF
 EOF
       ;;
     restls)
+      # version-hint is CLIENT-ONLY and has NO default: NewRestlsConfig rejects
+      # anything but tls12/tls13, so an absent value is a hard error rather than
+      # a fallback. It must describe what `dest` really negotiates, which is why
+      # probe_decoy measures it instead of hard-coding tls13.
+      printf '    tls: true\n    servername: %s\n' "$sni"
+      # Called outside the heredoc: command substitution strips trailing
+      # newlines, so $(...) inside one silently joins the next key onto the
+      # last emitted line and produces YAML that parses as something else.
+      _cli_alpn "$key"
       cat <<EOF
-    tls: true
-    servername: ${sni}
     restls-opts:
       password: "${RESTLS_PASSWORD}"
-      version-hint: tls13
+      version-hint: ${RESTLS_VERSION_HINT}
+      restls-script: "${RESTLS_SCRIPT_C}"
 EOF
       ;;
     jls)
@@ -2044,19 +3466,31 @@ EOF
 EOF
       ;;
     mkcp)
+      # The mirror image of the server block: seed / header / mtu / tti are
+      # copied verbatim because they must match, and the capacities and buffers
+      # are SWAPPED because they describe this side's link, not the server's.
+      # `uplink-capacity: 12` on a handset — the value both sides used to carry —
+      # is roughly 630 KB in flight upward, which on a real Iranian uplink is
+      # several seconds of queue that every DNS lookup then waits behind.
+      local dp up
+      dp="$(_pkts_down)"; up="$(_pkts_up)"
       cat <<EOF
     network: mkcp
     mkcp-opts:
       seed: ${MKCP_SEED}
-      header: srtp
-      mtu: 1350
-      tti: 50
-      uplink-capacity: 12
-      downlink-capacity: 100
-      congestion: false
+      header: $(_mkcp_header_of "$key")
+      mtu: ${KCP_MTU}
+      tti: ${MKCP_TTI}
+      uplink-capacity: $(_mkcp_cap "$up")
+      downlink-capacity: $(_mkcp_cap "$dp")
+      congestion: $(_mkcp_cong_of "$key")
+      write-buffer: $(_kcp_buf "$up")
+      read-buffer: $(_kcp_buf "$dp")
 EOF
       ;;
     mekya)
+      local dp up
+      dp="$(_pkts_down)"; up="$(_pkts_up)"
       cat <<EOF
     network: mekya
     mekya-opts:
@@ -2066,12 +3500,13 @@ EOF
       max-simultaneous-write-connection: 128
       packet-writing-buffer: 65536
       kcp:
-        mtu: 1350
-        tti: 15
-        uplink-capacity: 40
-        downlink-capacity: 2000
-        write-buffer: 67108864
-        read-buffer: 67108864
+        mtu: ${KCP_MTU}
+        tti: ${MKCP_TTI}
+        uplink-capacity: $(_mkcp_cap "$up")
+        downlink-capacity: $(_mkcp_cap "$dp")
+        congestion: true
+        write-buffer: $(_kcp_buf "$up")
+        read-buffer: $(_kcp_buf "$dp")
 EOF
       ;;
   esac
@@ -2104,19 +3539,23 @@ mihomo_of() {
       printf '    password: "%s"\n    udp: true\n    client-fingerprint: chrome\n    sni: %s\n    skip-cert-verify: %s\n' \
         "$PASSWORD" "$(_cli_sni "$key")" "$sci"
       _cli_xport "$key"
+      _cli_alpn "$key"
       case "${K_SEC[$key]}" in
         reality)   printf '    reality-opts:\n      public-key: %s\n      short-id: %s\n' "$REALITY_PUBLIC" "$REALITY_SHORTID" ;;
         shadowtls) printf '    shadow-tls-opts:\n      version: 3\n      password: "%s"\n' "$SHADOWTLS_PASSWORD" ;;
-        restls)    printf '    restls-opts:\n      password: "%s"\n      version-hint: tls13\n' "$RESTLS_PASSWORD" ;;
+        restls)    printf '    restls-opts:\n      password: "%s"\n      version-hint: %s\n      restls-script: "%s"\n' \
+                     "$RESTLS_PASSWORD" "$RESTLS_VERSION_HINT" "$RESTLS_SCRIPT_C" ;;
         jls)       printf '    jls-opts:\n      username: %s\n      password: "%s"\n' "$JLS_USER" "$JLS_PASSWORD" ;;
         tls)       [[ $CERT_MODE == self && -n $CERT_PIN ]] && printf '    fingerprint: %s\n' "$CERT_PIN" ;;
       esac ;;
     anytls)
       printf '    password: "%s"\n    udp: true\n    client-fingerprint: chrome\n    sni: %s\n    skip-cert-verify: %s\n' \
         "$PASSWORD" "$(_cli_sni "$key")" "$sci"
+      _cli_alpn "$key"
       case "${K_SEC[$key]}" in
         shadowtls) printf '    shadow-tls-opts:\n      version: 3\n      password: "%s"\n' "$SHADOWTLS_PASSWORD" ;;
-        restls)    printf '    restls-opts:\n      password: "%s"\n      version-hint: tls13\n' "$RESTLS_PASSWORD" ;;
+        restls)    printf '    restls-opts:\n      password: "%s"\n      version-hint: %s\n      restls-script: "%s"\n' \
+                     "$RESTLS_PASSWORD" "$RESTLS_VERSION_HINT" "$RESTLS_SCRIPT_C" ;;
         jls)       printf '    jls-opts:\n      username: %s\n      password: "%s"\n' "$JLS_USER" "$JLS_PASSWORD" ;;
         tls)       [[ $CERT_MODE == self && -n $CERT_PIN ]] && printf '    fingerprint: %s\n' "$CERT_PIN" ;;
       esac ;;
@@ -2128,13 +3567,39 @@ mihomo_of() {
         obfs-http:*|obfs-tls:*)
           printf '    plugin: obfs\n    plugin-opts:\n      mode: %s\n      host: %s\n' "${K_XPORT[$key]#obfs-}" "$OBFS_HOST" ;;
         kcptun:*)
-          printf '    plugin: kcptun\n    plugin-opts:\n      key: "%s"\n      crypt: aes-128\n      mode: fast\n      mtu: 1350\n      sndwnd: 1024\n      rcvwnd: 1024\n      datashard: 10\n      parityshard: 3\n' "$PASSWORD" ;;
+          # Windows are the inverse of the listener's, and conn/autoexpire/
+          # scavengettl appear ONLY here because only the client half acts on
+          # them.  Enabling kcptun also forces udp-over-tcp on this outbound and
+          # makes the listener UDP-only, both by construction upstream.
+          local _dp _up _n
+          _n="$(_kcptun_conn_of "$key")"
+          _dp="$(_kcp_wnd "$(_per_conn "$(_pkts_down)" "$_n")")"
+          _up="$(_kcp_wnd "$(_per_conn "$(_pkts_up)" "$_n")")"
+          printf '    plugin: kcptun\n    plugin-opts:\n'
+          printf '      key: "%s"\n      crypt: aes-128\n      mode: %s\n      mtu: %s\n' \
+            "$KCPTUN_KEY" "$(_kcptun_mode_of "$key")" "$KCP_MTU"
+          printf '      sndwnd: %s\n      rcvwnd: %s\n' "$_up" "$_dp"
+          printf '      datashard: %s\n      parityshard: %s\n      nocomp: true\n' \
+            "$(_kcptun_ds_of "$key")" "$(_kcptun_ps_of "$key")"
+          printf '      ratelimit: %s\n' "$(( $(_rate_up) / _n ))"
+          printf '      sockbuf: 8388608\n      smuxver: 2\n      smuxbuf: 8388608\n      streambuf: 2097152\n'
+          # keepalive under the 60 s idle window Iran's protocol whitelister
+          # keeps per flow — a flow that goes quiet for longer is re-evaluated.
+          printf '      keepalive: 10\n      dscp: 0\n'
+          if _kcptun_rotates "$key"; then
+            printf '      conn: %s\n      autoexpire: 25\n      scavengettl: 20\n' "$_n"
+          fi ;;
         *:shadowtls)
-          printf '    plugin: shadow-tls\n    plugin-opts:\n      host: %s\n      password: "%s"\n      version: 3\n      alpn: ["h2","http/1.1"]\n' "$STEAL_SNI" "$SHADOWTLS_PASSWORD" ;;
+          printf '    plugin: shadow-tls\n    plugin-opts:\n      host: %s\n      password: "%s"\n      version: 3\n      alpn: [%s]\n' \
+            "$(_decoy_sni)" "$SHADOWTLS_PASSWORD" "$(_alpn_yaml_inline)" ;;
         *:restls)
-          printf '    plugin: restls\n    plugin-opts:\n      host: %s\n      password: "%s"\n      version-hint: tls13\n' "$STEAL_SNI" "$RESTLS_PASSWORD" ;;
+          printf '    plugin: restls\n    plugin-opts:\n      host: %s\n      password: "%s"\n      version-hint: %s\n      restls-script: "%s"\n' \
+            "$(_decoy_sni)" "$RESTLS_PASSWORD" "$RESTLS_VERSION_HINT" "$RESTLS_SCRIPT_C" ;;
         *:jls)
-          printf '    plugin: jls\n    plugin-opts:\n      host: %s\n      username: %s\n      password: "%s"\n' "$STEAL_SNI" "$JLS_USER" "$JLS_PASSWORD" ;;
+          # Unlike jls-opts on vless/vmess/trojan, the shadowsocks jls plugin
+          # DOES take alpn, and it is the only ALPN this outbound has.
+          printf '    plugin: jls\n    plugin-opts:\n      host: %s\n      username: %s\n      password: "%s"\n      alpn: [%s]\n' \
+            "$(_decoy_sni)" "$JLS_USER" "$JLS_PASSWORD" "$(_alpn_yaml_inline)" ;;
       esac ;;
     snell)
       printf '    psk: "%s"\n    version: %s\n    udp: true\n    client-fingerprint: chrome\n' "$SNELL_PSK" "$SNELL_VERSION"
@@ -2143,11 +3608,14 @@ mihomo_of() {
         obfs-http:*|obfs-tls:*)
           printf '    obfs-opts:\n      mode: %s\n      host: %s\n' "${K_XPORT[$key]#obfs-}" "$OBFS_HOST" ;;
         *:shadowtls)
-          printf '    obfs-opts:\n      mode: shadow-tls\n      host: %s\n      password: "%s"\n      version: 3\n      alpn: ["h2","http/1.1"]\n' "$STEAL_SNI" "$SHADOWTLS_PASSWORD" ;;
+          printf '    obfs-opts:\n      mode: shadow-tls\n      host: %s\n      password: "%s"\n      version: 3\n      alpn: [%s]\n' \
+            "$(_decoy_sni)" "$SHADOWTLS_PASSWORD" "$(_alpn_yaml_inline)" ;;
         *:restls)
-          printf '    obfs-opts:\n      mode: restls\n      host: %s\n      password: "%s"\n      version-hint: tls13\n' "$STEAL_SNI" "$RESTLS_PASSWORD" ;;
+          printf '    obfs-opts:\n      mode: restls\n      host: %s\n      password: "%s"\n      version-hint: %s\n      restls-script: "%s"\n' \
+            "$(_decoy_sni)" "$RESTLS_PASSWORD" "$RESTLS_VERSION_HINT" "$RESTLS_SCRIPT_C" ;;
         *:jls)
-          printf '    obfs-opts:\n      mode: jls\n      host: %s\n      username: %s\n      password: "%s"\n' "$STEAL_SNI" "$JLS_USER" "$JLS_PASSWORD" ;;
+          printf '    obfs-opts:\n      mode: jls\n      host: %s\n      username: %s\n      password: "%s"\n      alpn: [%s]\n' \
+            "$(_decoy_sni)" "$JLS_USER" "$JLS_PASSWORD" "$(_alpn_yaml_inline)" ;;
       esac ;;
     hysteria2)
       printf '    password: "%s"\n    sni: %s\n    skip-cert-verify: %s\n' "$PASSWORD" "$VPN_DOMAIN" "$sci"
@@ -2197,6 +3665,38 @@ EOF
       [[ $CERT_MODE == self && -n $CERT_PIN ]] && printf '    fingerprint: %s\n' "$CERT_PIN" ;;
     *) return 1 ;;
   esac
+  _cli_mux "$key"
+  return 0
+}
+
+# Client half of sing-mux. `smux` is not part of any proxy's option struct — the
+# parser reads mapping["smux"] separately and wraps whatever adapter it just
+# built — so it is a top-level key on the proxy entry and valid on every type.
+# That also means a typo in here is silently ignored rather than rejected.
+#
+# protocol must be one of "", h2mux, smux, yamux; anything else is a hard error
+# at config load. It is negotiated, not agreed in advance: the client announces
+# its choice in the mux request and the server follows, which is why the
+# listener block has no protocol key.
+_cli_mux() {
+  _muxable "$1" || return 0
+  cat <<EOF
+    smux:
+      enabled: true
+      protocol: h2mux
+      padding: true
+      max-connections: 4
+      min-streams: 4
+      statistic: false
+EOF
+  # Brutal is a fixed-rate sender that ignores loss by design. The rates below
+  # are negotiated down to min(peer's receive rate, own send rate), so they must
+  # be MEASURED — an inflated number does not go faster, it retransmits into a
+  # policer and produces exactly the burst that gets a flow killed here.
+  if [[ $BRUTAL == yes ]]; then
+    printf '      brutal-opts:\n        enabled: true\n        up: "%s Mbps"\n        down: "%s Mbps"\n' \
+      "$CLI_UP_MBPS" "$CLI_DOWN_MBPS"
+  fi
   return 0
 }
 
@@ -2447,18 +3947,69 @@ EOF
     if mihomo_of "$key" >>"$f" 2>/dev/null; then names+=("$(node_name "$key")"); fi
   done
   {
+    # Two automatic groups, because they fail over on different principles and
+    # this network kills flows on a timescale neither one alone covers.
+    #
+    #   AUTO     url-test — picks the lowest latency of everything alive. Best
+    #            steady-state choice, but it memoises its pick in a singleflight
+    #            with a 10-SECOND result TTL, so it can keep handing out a node
+    #            the health checker has already buried for up to 10 s.
+    #   FAILOVER fallback — takes the first node in list order that is alive and
+    #            moves on the moment it is not. No latency optimisation, no
+    #            10 s cache. This is the one to select when nodes are dying.
+    #
+    # interval is SECONDS (default 300 — five minutes of a dead node selected,
+    # against measured flow kills at 7-35 s), tolerance is MILLISECONDS, and
+    # timeout is MILLISECONDS. Note that timeout does double duty: it is both
+    # the per-probe deadline AND the window in which max-failed-times failures
+    # have to occur, so shortening it also shortens that window — hence the
+    # matching drop in max-failed-times.
+    #
+    # lazy defaults to TRUE, which skips a tick whenever the group has not been
+    # dialled through within the last interval. Note what that does and does not
+    # mean: the group you have SELECTED is being dialled through, so it probes on
+    # every tick regardless. lazy only decides whether the group you are NOT
+    # using stays warm.
+    #
+    # So lazy:false is set on FAILOVER alone. That keeps the escape hatch warm
+    # for the moment a node dies, and costs one probe per node per interval —
+    # setting it on both groups would double the probe traffic to buy nothing,
+    # because the two groups have separate health checkers and do not share
+    # results. With the full catalogue that difference is ~80 extra dials a
+    # minute to one IP across ~80 ports, which is a port-scan-shaped pattern and
+    # the opposite of what the multiplexing above is for.
+    #
+    # The test URL is Cloudflare's rather than gstatic's: ten clients probing
+    # the same Google endpoint on the same schedule is both rate-limited and a
+    # pattern. expected-status pins it to 204 so a captive portal's 200 does not
+    # read as success.
+    local _url="http://cp.cloudflare.com/generate_204"
     echo "proxy-groups:"
     echo "  - name: PROXY"
     echo "    type: select"
     echo "    proxies:"
     echo "      - AUTO"
+    echo "      - FAILOVER"
     for n in "${names[@]}"; do echo "      - \"$n\""; done
     echo "      - DIRECT"
     echo "  - name: AUTO"
     echo "    type: url-test"
-    echo "    url: https://www.gstatic.com/generate_204"
-    echo "    interval: 300"
-    echo "    tolerance: 50"
+    echo "    url: ${_url}"
+    echo "    interval: ${PROBE_INTERVAL}"
+    echo "    timeout: ${PROBE_TIMEOUT}"
+    echo "    tolerance: 30"
+    echo "    max-failed-times: 2"
+    echo "    expected-status: '204'"
+    echo "    proxies:"
+    for n in "${names[@]}"; do echo "      - \"$n\""; done
+    echo "  - name: FAILOVER"
+    echo "    type: fallback"
+    echo "    url: ${_url}"
+    echo "    interval: ${PROBE_INTERVAL}"
+    echo "    timeout: ${PROBE_TIMEOUT}"
+    echo "    lazy: false"
+    echo "    max-failed-times: 2"
+    echo "    expected-status: '204'"
     echo "    proxies:"
     for n in "${names[@]}"; do echo "      - \"$n\""; done
     echo "rules:"
@@ -2541,11 +4092,82 @@ write_readme() {
     echo
     echo "Camouflage targets — these must stay reachable FROM THE SERVER:"
     echo "  REALITY dest                 ${REALITY_SNI}:443"
-    echo "  ShadowTLS/RestLS/JLS/mirror  ${STEAL_SNI}:443"
+    if _decoy_local; then
+      echo "  ShadowTLS/RestLS/JLS         127.0.0.1:${DECOY_PORT}  (local nginx, serving ${VPN_DOMAIN})"
+      echo "    Clients present servername ${VPN_DOMAIN}, which is this IP's real"
+      echo "    certificate — no SNI/IP disagreement to score, and RestLS no longer"
+      echo "    pays a round trip to a third party on every connection."
+      echo "    Nothing external is required for the disguise to hold."
+    else
+      echo "  ShadowTLS/RestLS/JLS/mirror  ${STEAL_SNI}:443"
+      echo "    Clients present servername ${STEAL_SNI} to an IP that is not theirs."
+      echo "    --decoy local removes both that disagreement and the per-connection"
+      echo "    round trip RestLS pays to reach this host — at the cost of putting"
+      echo "    every camouflage layer behind ONE name of yours, which a single"
+      echo "    blocklist entry can take out. It is a different bet, not a free win."
+    fi
     echo "  Hysteria2 masquerade         https://${STEAL_SNI}"
-    echo "  An unauthenticated prober is proxied to those sites verbatim; if the"
+    echo "  An unauthenticated prober is proxied to those targets verbatim; if the"
     echo "  server cannot reach them, the disguise fails open and looks anomalous."
     echo
+    echo "TRANSPORT TUNING (the numbers every window in these files derives from)"
+    echo "  client link          ${CLI_DOWN_MBPS} Mbit/s down, ${CLI_UP_MBPS} Mbit/s up"
+    echo "  server link          ${SRV_UP_MBPS} Mbit/s up, ${SRV_DOWN_MBPS} Mbit/s down"
+    echo "  path                 ${PATH_RTT_MS} ms RTT, ~${PATH_LOSS_PCT}% loss assumed"
+    echo "  KCP framing          mtu ${KCP_MTU}, tti ${MKCP_TTI} ms"
+    echo "  windows              $(_pkts_down) packets in flight down, $(_pkts_up) up"
+    echo
+    echo "  mKCP and kcp-tun size their windows from the link of the side that"
+    echo "  writes the number, so the two ends carry DIFFERENT values on purpose:"
+    echo "  the server's uplink-capacity governs your download, the client's"
+    echo "  governs your upload. Only seed/header/mtu/tti (mKCP) and"
+    echo "  key/crypt/mode/mtu/datashard/parityshard/nocomp (kcp-tun) must match."
+    echo "  If your real link differs from the numbers above, re-run with"
+    echo "  --client-down-mbps / --client-up-mbps / --rtt-ms rather than editing"
+    echo "  the YAML — every buffer is derived and they have to stay consistent."
+    echo
+    echo "  Variants exist so you can measure instead of guess. Same protocol,"
+    echo "  one parameter changed, its own port:"
+    echo "    vmess-mkcp / -dtls / -wechat / -utp    packet header disguise"
+    echo "    vmess-mkcp-nocong                      congestion control off"
+    echo "    ss-kcptun / -static                    source-port rotation on/off"
+    echo "    ss-kcptun-fec                          FEC 10/3 instead of 10/1"
+    echo "    ss-kcptun-fast3                        lower latency, higher packet rate"
+    echo "  Note FEC cannot be switched off: mihomo rewrites datashard/parityshard"
+    echo "  0 to 10/3, so 10/1 is the lowest overhead reachable."
+    echo
+    echo "  \`mihomoctl amplification\` reports wire bytes over payload bytes per"
+    echo "  port. That ratio, not throughput, is what decides how long this IP"
+    echo "  survives — volume graylisting has been reported at roughly 40 GB in"
+    echo "  two hours. Compare a variant against its baseline there."
+    echo
+    if _sec_used restls; then
+      echo "RESTLS RECORD PROGRAMME (per deployment — do not share it between nodes)"
+      echo "  server->client  ${RESTLS_SCRIPT_S}"
+      echo "  client->server  ${RESTLS_SCRIPT_C}"
+      echo "  Both halves fall back to one built-in default string when unset, so"
+      echo "  every untouched RestLS deployment emits the same record-length"
+      echo "  sequence. These two were generated for this node; if you deploy a"
+      echo "  second node, let it generate its own."
+      echo
+    fi
+    if _muxable_any; then
+      echo "MULTIPLEXING"
+      echo "  vless / vmess / trojan / shadowsocks nodes carry sing-mux. The point is"
+      echo "  connection COUNT, not throughput: ISP QoS bites past roughly 4-8"
+      echo "  concurrent connections to one IP, and each new connection is another"
+      echo "  first-two-packets event for a protocol whitelister to score."
+      echo "  Padding is set client-side only. On a listener it is an ENFORCEMENT"
+      echo "  that rejects any unpadded mux connection, which would lock out every"
+      echo "  client that cannot express it — share links and sing-box configs have"
+      echo "  no field for it. Client-side padding puts the same bytes on the wire."
+      if [[ $BRUTAL == yes ]]; then
+        echo "  TCP Brutal is ON at ${CLI_UP_MBPS}/${CLI_DOWN_MBPS} Mbit/s up/down. It is a fixed-rate"
+        echo "  sender that ignores loss by design; if flows start dying under load,"
+        echo "  turn it off first."
+      fi
+      echo
+    fi
     echo "Credentials:"
     echo "  vless/vmess uuid    : ${UUID}"
     echo "  trojan/anytls/hy2   : ${PASSWORD}"
@@ -2564,6 +4186,8 @@ write_readme() {
     [[ -n $TT_PASSWORD ]]        && echo "  trusttunnel         : ${TT_USER} / ${TT_PASSWORD}"
     [[ -n $REALM_TOKEN ]]        && echo "  hysteria2-realm tok : ${REALM_TOKEN}  (rendezvous server, not a proxy inbound)"
     [[ -n $API_SECRET ]]         && echo "  RESTful api secret  : ${API_SECRET}  (bound to ${API_LISTEN})"
+    echo
+    [[ -n $KCPTUN_KEY ]]         && echo "  kcp-tun key         : ${KCPTUN_KEY}  (its own secret, not shared)"
     echo
     echo "Paths / names: ws=${WS_PATH}  grpc=${GRPC_SVC}  xhttp=${XHTTP_PATH}  mkcp-seed=${MKCP_SEED}  obfs-host=${OBFS_HOST}"
   } >"$f"
@@ -2588,7 +4212,12 @@ gen_artifacts() {
   write_client_singbox
   write_readme
   chmod 0600 "${CLIENT_OUT_DIR}"/*.txt "${CLIENT_OUT_DIR}"/*.json "${CLIENT_OUT_DIR}"/*.yaml 2>/dev/null || true
-  ok "Bundles written to ${CLIENT_OUT_DIR}  (${#links[@]} share link(s), $(selected_count) YAML node(s))"
+  # Count what actually landed in the YAML, not the listener count: a listener
+  # that is not a client-dialable proxy (the realm rendezvous server) is deployed
+  # but has no proxies: entry, so selected_count would overstate this by one.
+  local _y=0
+  for key in $SELECTED; do mihomo_of "$key" >/dev/null 2>&1 && _y=$((_y+1)); done
+  ok "Bundles written to ${CLIENT_OUT_DIR}  (${#links[@]} share link(s), ${_y} YAML node(s))"
   setup_sub_server
   return 0
 }
@@ -2729,6 +4358,7 @@ BANNER
   printf '    %s\n' "mihomoctl info        # reprint links / credentials"
   printf '    %s\n' "mihomoctl status      # service + listening ports"
   printf '    %s\n' "mihomoctl check       # health checks"
+  printf '    %s\n' "mihomoctl amplification  # wire bytes vs payload, per port"
   printf '    %s\n' "mihomoctl update      # upgrade mihomo"
   printf '    %s\n' "journalctl -u mihomo -f"
   hr
@@ -2757,11 +4387,37 @@ do_update() {
   install_mihomo
   if [[ -r $MH_CONF ]] && "$MH_BIN" -t -d "$MH_HOME" >/dev/null 2>&1; then
     systemctl restart mihomo || true; sleep 2
-    systemctl is-active --quiet mihomo && ok "mihomo updated and restarted." || bad "mihomo did not come back up."
+    if systemctl is-active --quiet mihomo; then
+      ok "mihomo updated and restarted."
+      # The restart zeroed mihomo's payload counters but not the kernel's wire
+      # counters, so the two sides would cover different windows from here on and
+      # every later amplification ratio would read low. Re-base both.
+      if [[ $METERING == yes ]] && _meter_available && nft list table inet "$METER_TABLE" >/dev/null 2>&1; then
+        nft reset counters table inet "$METER_TABLE" >/dev/null 2>&1 || true
+        _meter_baseline
+        log "Wire-amplification counters re-based after the restart."
+      fi
+    else
+      bad "mihomo did not come back up."
+    fi
   else
     warn "Existing config missing or invalid for the new version; not restarting."
   fi
   save_state
+  return 0
+}
+
+_uninstall_extras() {
+  if have nft; then nft delete table inet "$METER_TABLE" >/dev/null 2>&1 || true; fi
+  rm -f "$METER_BASE" "$DECOY_UNIT_DROPIN"
+  if [[ -e /etc/nginx/sites-enabled/$(basename "$DECOY_SITE") || -e $DECOY_SITE ]]; then
+    rm -f "/etc/nginx/sites-enabled/$(basename "$DECOY_SITE")" "$DECOY_SITE"
+    rm -rf "$DECOY_ROOT"
+    # nginx is left installed — it may predate this script or serve something
+    # else — but the decoy site is removed and the config reloaded.
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    ok "Removed the camouflage decoy site (nginx itself left installed)."
+  fi
   return 0
 }
 
@@ -2778,6 +4434,7 @@ do_uninstall() {
   iptables -D INPUT -j MIHOMO_IN 2>/dev/null || true
   iptables -F MIHOMO_IN 2>/dev/null || true; iptables -X MIHOMO_IN 2>/dev/null || true
   have netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+  _uninstall_extras
   systemctl daemon-reload; sysctl --system >/dev/null 2>&1 || true
   ok "Removed. Kept: ${MH_BIN}, ${STATE_DIR} and ${CLIENT_OUT_DIR}."
   ok "Delete ${MH_BIN} yourself if you want the binary gone too."
@@ -2809,6 +4466,13 @@ install_self() {
 # 16. Main
 # -----------------------------------------------------------------------------
 main() {
+  # Keep argv: save_state writes a file of UNCONDITIONAL assignments, so sourcing
+  # it in load_state silently undoes everything parse_args just set. Before the
+  # link profile and --decoy existed that was invisible — the saved values were
+  # the same ones the flags would have set. Now a redeploy with
+  # `--decoy local --client-up-mbps 30` would quietly keep last run's values and
+  # report success. The command line has to win, so it is replayed afterwards.
+  local -a _argv=("$@")
   parse_args "$@"
   need_root
   install -d -m 0700 "$STATE_DIR"
@@ -2820,6 +4484,14 @@ main() {
     update)    load_state; do_update; exit 0 ;;
     regen-sub) load_state; [[ -n $SELECTED ]] || die "No saved state — run a deploy first."; gen_artifacts; save_state; do_info; exit 0 ;;
     uninstall) load_state; do_uninstall; exit 0 ;;
+    # `|| _rc=$?` rather than a bare call: do_pmtu returns 1 by design when the
+    # target does not answer, and under `set -e` that fires the ERR trap and
+    # prints a spurious "failed at line N" over the real diagnosis.
+    pmtu)      load_state; _rc=0; do_pmtu "$PMTU_TARGET" || _rc=$?; exit "$_rc" ;;
+    amplification)
+      load_state
+      [[ $METER_RESET == yes ]] && { do_amplification --reset; exit 0; }
+      do_amplification; exit 0 ;;
     deploy)    : ;;
   esac
 
@@ -2827,8 +4499,12 @@ main() {
   printf '%s %d protocol x transport x security combinations; every secret and subscription generated %s\n\n' "$C_D" "${#ALL_KEYS[@]}" "$C_RST"
 
   load_state
+  parse_args "${_argv[@]}"
+  validate_tunables
   resolve_selection
   collect_config
+  # collect_config can still change CERT_MODE, and `auto` depends on it.
+  resolve_decoy_mode
 
   start_logging
   [[ $SKIP_PREFLIGHT == yes ]] || preflight
@@ -2844,10 +4520,25 @@ main() {
   done
   unset _k
   setup_cert
+  # setup_cert may fall back to self-signed, which disqualifies the local decoy.
+  resolve_decoy_mode
+  setup_decoy
+  # The config has to describe what the decoy really does, not what we hoped:
+  # version-hint has no default and is a hard error if wrong, and a JLS alpn that
+  # does not intersect the client's kills the connection instead of falling back.
+  if uses_decoy; then
+    if _decoy_local; then probe_decoy 127.0.0.1 "$DECOY_PORT" || true
+    else                  probe_decoy "$STEAL_SNI" 443 || true; fi
+  fi
   write_mihomo_config
   kernel_tuning
   firewall_setup
+  setup_metering
   start_services
+  # After start_services, not before: start_services restarts mihomo, which
+  # zeroes its own payload counters. A baseline taken before the restart would
+  # be larger than every later reading and make the delta negative.
+  [[ $METERING == yes ]] && _meter_baseline
   gen_artifacts
 
   save_state

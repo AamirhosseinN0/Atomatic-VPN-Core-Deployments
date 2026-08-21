@@ -52,7 +52,7 @@ sudo bash Singbox_Deployment.sh -y --domain vpn.example.com
 | [`iKev2_Deployment.sh`](iKev2_Deployment.sh) | an **IKEv2/IPsec VPN gateway** (strongSwan) for Windows 10/11 and Android, with username/password **and** certificate auth | [README-ikev2.md](README-ikev2.md) |
 | [`Singbox_Deployment.sh`](Singbox_Deployment.sh) | a **[sing-box](https://sing-box.sagernet.org)** proxy node — VLESS-Reality, VLESS-WS, Hysteria2, TUIC, Trojan, AnyTLS, ShadowTLS, Shadowsocks-2022, NaiveProxy, VMess, Snell v5/v6 | [README-singbox.md](README-singbox.md) |
 | [`Xray_Deployment.sh`](Xray_Deployment.sh) | an **[Xray-core](https://xtls.github.io)** proxy node — VLESS-Reality/Vision, XHTTP, post-quantum VLESS Encryption, Trojan, VMess, Hysteria2, SS-2022, and a fallbacks mode hiding several protocols behind one HTTPS port | [README-xray.md](README-xray.md) |
-| [`Mihomo_Deployment.sh`](Mihomo_Deployment.sh) | a **[mihomo](https://github.com/MetaCubeX/mihomo) (Clash.Meta)** node — 74 protocol × transport × camouflage combinations, including ShadowQUIC, Mieru, Sudoku, TrustTunnel, JLS/RestLS, mKCP/Mekya and Snell v1–v4 | [README-mihomo.md](README-mihomo.md) |
+| [`Mihomo_Deployment.sh`](Mihomo_Deployment.sh) | a **[mihomo](https://github.com/MetaCubeX/mihomo) (Clash.Meta)** node — 81 protocol × transport × camouflage combinations, including ShadowQUIC, Mieru, Sudoku, TrustTunnel, JLS/RestLS, mKCP/Mekya and Snell v1–v4 | [README-mihomo.md](README-mihomo.md) |
 
 ### Which one do I want?
 

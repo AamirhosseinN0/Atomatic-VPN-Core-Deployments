@@ -155,7 +155,6 @@ LE_EMAIL=""
 # should be something you can reason about and measure, not 81 sockets — pick
 # the winner on your own path, then re-deploy with --protocols <that key>.
 PROTO_CHOICE="sampler"
-PROTO_CHOICE_SET="no"         # yes once --protocols is seen, which skips the picker
 SELECTED=""
 
 LISTEN_ADDR="::"              # bare IP only; '::' is dual-stack, '0.0.0.0' v4-only
@@ -1088,7 +1087,7 @@ parse_args() {
       --channel)          INSTALL_CHANNEL="$2"; shift 2 ;;
       --version)          PIN_VERSION="$2"; INSTALL_CHANNEL="pinned"; shift 2 ;;
       --amd64-level)      AMD64_LEVEL="$2"; shift 2 ;;
-      --protocols)        PROTO_CHOICE="$2"; PROTO_CHOICE_SET="yes"; shift 2 ;;
+      --protocols)        PROTO_CHOICE="$2"; shift 2 ;;
       --no-picker)        TUI_ENABLED="no"; shift ;;
       --listen)           LISTEN_ADDR="$2"; shift 2 ;;
       --cert-mode)        CERT_MODE="$2"; shift 2 ;;

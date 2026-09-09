@@ -35,7 +35,8 @@ Neither sing-box nor Xray-core implements any of those.
 ## The combination space
 
 The catalogue is not a hand-written list — it is the **cross product** of three axes, minus
-the combinations the core rejects or cannot actually use. `--protocols all` deploys all 81.
+the combinations the core rejects or cannot actually use. `--protocols all` deploys all 81;
+the default is `sampler`, which deploys exactly one of each base protocol.
 
 | Base | Transports | Security layers | Count |
 |---|---|---|---|
@@ -334,7 +335,8 @@ After a deploy the script installs itself as `/usr/local/sbin/mihomoctl` (when r
 | `--channel <stable\|alpha\|pinned>` | `stable` | `alpha` = rolling `Prerelease-Alpha` build |
 | `--version <tag>` | — | Exact tag for `--channel pinned`, e.g. `v1.19.30` |
 | `--amd64-level <auto\|v1\|v2\|v3>` | `auto` | Plain `amd64` asset is a v3 build; see the amd64 trap |
-| `--protocols <all\|recommended\|core\|list>` | `all` | Keys, families or security layers, comma-separated |
+| `--protocols <sampler\|recommended\|core\|all\|list>` | `sampler` | Keys, families or security layers, comma-separated. Omit it on an interactive run to get the checkbox picker |
+| `--no-picker` | picker on | Skip the checkbox picker; use the typed prompt |
 | `--listen <addr>` | `::` | Bare IP; `::` dual-stack, `0.0.0.0` v4-only |
 | `--cert-mode <letsencrypt\|self>` | `letsencrypt` | Only if a selected protocol wants a cert |
 | `--le-email <email>` | — | Let's Encrypt contact |
@@ -360,8 +362,7 @@ After a deploy the script installs itself as `/usr/local/sbin/mihomoctl` (when r
 | `--loss-pct <n>` | `2` | Guides the FEC ratio only |
 | `--kcp-mtu <n>` | `1200` | QUIC's safe-datagram floor; survives mobile paths |
 | `--mkcp-tti <n>` | `25` | mKCP tick, ms; must divide 1000 exactly |
-| `--probe-interval <n>` | `60` | Client health-check interval, seconds |
-| | | `lazy: false` is set on `FAILOVER` only — see below |
+| `--mtu <n>` | `1280` | Client TUN MTU, 576–9000. The IPv6 minimum, so every network carries it |
 | `--brutal` / `--no-brutal` | off | TCP Brutal over smux; see below |
 
 ---
@@ -494,28 +495,90 @@ The listener therefore emits `mux-option` only when `--brutal` is on, since brut
 the one thing that genuinely has to be declared server-side. The mux *service* itself is
 always active on the eight supported inbound types — there is no on/off switch.
 
-### Failover
+### No health checks
 
-The client config carries two automatic groups, because they fail over on different principles
-and this network kills flows on a timescale neither covers alone:
+The client config has exactly **one** proxy group: `PROXY`, of type `select`, holding every
+node plus `DIRECT`. There is no `url-test` group, no `fallback` group, and nothing anywhere
+with an `interval`.
 
-| Group | Type | Behaviour |
+That is deliberate. A health-checked group is the only thing in a client config that puts
+packets on the wire while you are sending none: one dial per node, per group, per interval,
+forever. With a full bundle that is a steady drip of connections to a single IP across dozens
+of ports — port-scan shaped, on a metered mobile link, whether or not the tunnel is in use.
+An idle client here is genuinely idle.
+
+**The trade is real and it is yours to make:** nothing fails over for you. If the node you
+picked stops passing traffic, you pick another one in the client. `profile.store-selected: true`
+means the choice survives a restart. On this path that is not much of a loss — a url-test group
+memoises its pick with a 10-second TTL and can keep handing out a node the checker has already
+buried, so it was never the instant escape hatch it looks like.
+
+If you want automatic failover back, add a group to the generated YAML by hand:
+
+```yaml
+  - name: AUTO
+    type: fallback
+    url: https://cp.cloudflare.com/generate_204
+    interval: 60
+    expected-status: '204'
+    proxies: [ ... ]
+```
+
+and put `AUTO` at the top of `PROXY`'s list. Know what you are buying: one dial per listed node
+per minute, permanently.
+
+### What else was cut, and why
+
+| Setting | Why |
+|---|---|
+| `unified-delay: false` | It sends a **second** `HEAD` on every latency check so the reported number excludes the handshake (`adapter/adapter.go:259`) — and upstream warns against it on a plain `http://` URL. Dead weight with no automatic checks, and still wrong if you add one back. |
+| no `external-controller` | It stands up an HTTP server plus a websocket streaming every connection event, and the tables feeding it are retained. A GUI client injects its own. Add it back if you drive mihomo from the command line. |
+| `geo-auto-update: false`, no GEOIP/GEOSITE rules | The geo databases are tens of megabytes resident and are the largest single thing a mihomo client can be made to hold. Every rule in the generated config is a plain CIDR. |
+
+`sniffer` is off, `store-fake-ip` is off, `log-level` is `silent`, `tcp-concurrent` is off, and
+`keep-alive-idle` is raised to 600 s so an idle mobile link is not woken every 15 s to hold a
+NAT binding open.
+
+---
+
+## MTU: the setting that fails without failing
+
+`--mtu` (default **1280**) is the size of the packet an application hands to the tunnel. It is
+the single most likely thing to be wrong on an Iranian path and the least likely to look wrong.
+
+The failure is silent. PMTU discovery needs the router that drops an over-large packet to send
+back an ICMP *fragmentation needed*, and MCI/MTN suppress it after a couple of packets. So an
+MTU above what the path really carries is never corrected downward — the packets simply
+vanish. Handshakes, DNS answers and control frames are small enough to fit and succeed, which
+is why **the client reports connected**; full-size TLS records and QUIC datagrams do not, which
+is why pages hang half-loaded and image-heavy apps crawl. It also changes between sessions and
+between networks, because Wi-Fi over PPPoE (1492), mobile GTP encapsulation (~1400) and CGNAT
+each shave off a different amount.
+
+1280 is the IPv6 minimum, so every network on the path is *required* to carry it. That is what
+makes it the value to ship on a client that roams: one number, no per-network retuning.
+Under-declaring costs about 4% of throughput; over-declaring costs the session.
+
+mihomo's own default is 9000, which assumes a path that will fragment or report back. This one
+does neither, so the generated client config writes a `tun:` block — disabled, since TUN needs
+`NET_ADMIN` and a GUI toggles it itself — carrying the MTU, so that when TUN *is* switched on
+it comes up at a size the path can carry rather than at 9000.
+
+### `--mtu` and `--kcp-mtu` are different numbers
+
+They sit on opposite sides of the encapsulation and neither follows the other:
+
+| Flag | Layer | Default |
 |---|---|---|
-| `AUTO` | `url-test` | Lowest latency of everything alive. Best steady-state pick, but it memoises its choice in a singleflight with a **10-second TTL**, so it can keep handing out a node the health checker has already buried. |
-| `FAILOVER` | `fallback` | First node in list order that is alive, and it moves the moment it is not. No latency optimisation, no 10 s cache — the one to select when nodes are dying. |
+| `--mtu` | the **inner** packet an app hands to the tunnel | `1280` |
+| `--kcp-mtu` | the **outer** UDP datagram mKCP / kcp-tun writes to the wire | `1200` |
 
-`interval` is seconds (the stock default is 300 — five minutes of a dead node selected, against
-flow kills measured at 7–35 s), `tolerance` is milliseconds, and `timeout` is milliseconds.
-`timeout` does double duty: it is both the per-probe deadline *and* the window in which
-`max-failed-times` failures must occur, so shortening one shortens the other — hence the
-matching drop to `max-failed-times: 2`.
-
-`lazy: false` is set on `FAILOVER` alone. `lazy` only decides whether the group you are *not*
-using stays warm — the group you have selected is being dialled through, so it probes on every
-tick regardless. Setting it on both groups would double the probe traffic to buy nothing, since
-the two groups have separate health checkers and do not share results. With the full catalogue
-that difference is ~80 extra dials a minute to one IP across ~80 ports, which is a
-port-scan-shaped pattern and the opposite of what the multiplexing above is for.
+`mihomoctl pmtu <host>` measures once and sizes both — the measured payload is directly the
+safe `--kcp-mtu`, and the safe `--mtu` is that path MTU less 80 bytes, which covers the worst
+case here (IPv4 + UDP + QUIC long header + the AEAD tag a hysteria2/tuic/shadowquic datagram
+adds). It measures **this server's path to that address**, so it is a floor for one network and
+not a value to ship to a phone that roams; no answer at any size means "ICMP is filtered", not
+"the MTU is tiny".
 
 ### Measuring instead of guessing
 
@@ -556,15 +619,143 @@ sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols recommend
 
 | Preset | Meaning |
 |---|---|
-| `all` | every valid combination (81) — the default |
+| `sampler` | **the default** — exactly one listener per base protocol (12) |
 | `recommended` | a curated 14 covering every distinct technique |
 | `core` | the 8 classics the sing-box / Xray scripts also offer |
+| `all` | every valid combination (81) |
 | families | `vless` `vmess` `trojan` `anytls` `ss` `snell` `mieru` `sudoku` `trusttunnel` `shadowquic` `quic` `exotic` |
 | by security | `reality` `shadowtls` `restls` `jls` `tls` |
 | by transport | `ws` `grpc` `xhttp` `mkcp` `mekya` `kcptun` |
 
-Deploying all 81 means 81 listening sockets and 81 firewall openings. It works — but
-`recommended` is the saner default for a production node, and the script says so.
+Deploying all 81 means 81 listening sockets and 81 firewall openings. It works — but it is
+the wrong shape for a first deploy, and the script says so.
+
+### `sampler`: one of each, so you can tune
+
+`sampler` is the default because the question you actually have on a censored path is not
+"which VLESS transport is fastest" but **"which of these families still passes traffic here at
+all"**. `recommended` and `core` both lean towards VLESS, because that is what is popular;
+neither answers that question.
+
+`sampler` deploys one node per base protocol — twelve listeners, each the least exotic member
+of its family, so a failure is the family's fault and not some transport's:
+
+```
+vless-tcp-reality   vmess-ws-tls    trojan-tcp-tls   anytls-tls
+ss-plain            snell-plain     hysteria2        tuic
+shadowquic          mieru-tcp       sudoku           trusttunnel-tcp
+```
+
+Run it, watch which nodes survive on your own path for a day, then re-deploy with
+`--protocols <the winner>` and spend the ports on *its* variants instead:
+
+```bash
+# tuning deploy: one of everything
+sudo bash Mihomo_Deployment.sh --domain vpn.example.com
+
+# hysteria2 held up best -> now deploy its variants and measure those
+sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols hysteria2,tuic,shadowquic
+```
+
+The preference list names *which member* of a family to use; it is not the source of truth for
+which families exist. Anything in the catalogue that the list does not cover is picked up
+automatically, so a protocol added upstream cannot go missing from the one preset that claims
+to cover everything.
+
+### The interactive menu
+
+Run the script with no flags and you get one screen holding **every setting it has** — with its
+current value — instead of a thirty-question interrogation you cannot go back in. Arrow keys
+move, `Enter` edits the highlighted row, `d` deploys.
+
+```
+   mihomo deployment settings   12 listener(s)
+   Every setting this script has. Enter edits the highlighted row.
+
+   ── Server identity
+ ❯ Domain (FQDN)              <required>
+   Public IPv4                203.0.113.10
+   Node label                 <from the domain>
+   ── mihomo build
+   Release channel            stable
+   GOAMD64 level              auto
+   ── Protocols
+   Selection                  sampler  (12 listeners)
+   Bind address               ::
+   Auto-assign ports          yes
+   ── Certificate and camouflage
+   Certificate source         letsencrypt
+   ...
+
+   the name clients dial, and the certificate CN. Required.
+   enter edit   ←/→ cycle a choice   d deploy   q cancel
+```
+
+| Key | Does |
+|---|---|
+| `↑` `↓` / `k` `j` | move between settings |
+| `←` `→` | cycle a multiple-choice setting without leaving the row |
+| `Enter` | edit — a text prompt, a toggle, or the protocol picker |
+| `PgUp` `PgDn`, `g` `G` | page, jump to top or bottom |
+| `d` | deploy with these settings |
+| `q` / `Esc` | cancel the run |
+
+The line above the key list is the help for whatever row you are on, so the explanation is
+where you are looking rather than in `--help`.
+
+**Rows appear and disappear as you answer.** A setting that cannot matter given your other
+answers is hidden, not greyed out — a control you can see and change but that is never read is
+worse than one that is absent, because it reads as having taken effect. Pick `sampler` and you
+are asked about the Shadowsocks cipher and the Snell version; pick `--protocols quic` and both
+vanish along with the RestLS record floor. Set the channel to `pinned` and a tag row appears
+directly beneath it. Choose a selection that wants no certificate and the whole certificate
+section goes.
+
+At a text field, `Enter` on an empty line keeps the current value and `-` clears it — which is
+how you say "no Let's Encrypt contact address", "auto-detect the IP" or "turn the RESTful
+controller off".
+
+Two things are checked before `d` will deploy: a domain that is actually a domain, and a
+version tag if the channel is `pinned`. Both fail with a message at the top of the menu rather
+than eight steps into an install.
+
+### The protocol picker
+
+`Enter` on the **Selection** row opens the picker. First screen is the presets as radio
+buttons; `e` opens the highlighted preset as an editable checklist, and `custom` opens the full
+81-entry catalogue:
+
+```
+ ❯ (●) sampler       one listener per protocol family  12 listener(s)
+   ( ) recommended   a curated spread of every distinct technique  14 listener(s)
+   ( ) core          the classics the sing-box / Xray scripts also offer  8 listener(s)
+   ( ) all           every valid combination in the catalogue  81 listener(s)
+   ( ) custom …      tick individual protocols on the next screen
+
+ ── vless
+ ❯ [✓] vless-tcp-reality       tcp  tcp        reality
+   [ ] vless-tcp-tls           tcp  tcp        tls
+   [ ] vless-ws-tls            tcp  ws         tls
+```
+
+| Key | Does |
+|---|---|
+| `space` | tick or untick the node under the cursor |
+| `f` | tick or untick the **whole family** the cursor is in |
+| `a` / `n` / `i` | all / none / invert |
+| `Enter` | accept |
+| `q` / `Esc` | back to the menu, unchanged |
+
+A hand-ticked set that happens to equal a preset is stored under the preset's name rather than
+as an 81-key comma string.
+
+### When the menu is skipped
+
+`-y`, a `TERM` the script cannot drive, a terminal smaller than 50x14, or `--no-picker` all fall
+back to asking the same settings one line at a time. Both front ends walk **one** table, so a
+parameter cannot be editable in the menu and invisible in the typed prompt — which is exactly
+how the older version ended up asking about eleven settings and silently defaulting twenty.
+With `-y` nothing is asked at all and every value comes from a flag or its default.
 
 ---
 

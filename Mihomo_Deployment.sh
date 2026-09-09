@@ -45,6 +45,30 @@
 #  layer, mekya with ws/grpc, and WebSocket with REALITY (see build_catalogue) —
 #  are deliberately absent.
 #
+#  Interactive run:
+#     Run it with no flags and every setting the script has is on one screen,
+#     with its current value — arrow keys to move, enter to edit, d to deploy.
+#     Rows that cannot matter given your other answers are hidden rather than
+#     shown inert. -y, a dumb terminal or --no-picker fall back to asking the
+#     same settings one line at a time; both front ends walk one table, so a
+#     parameter cannot be editable in one and invisible in the other.
+#
+#  Protocol selection:
+#     --protocols sampler   (the DEFAULT) one listener per base protocol — 12
+#                           nodes, one each of vless / vmess / trojan / anytls /
+#                           ss / snell / hysteria2 / tuic / shadowquic / mieru /
+#                           sudoku / trusttunnel. A first deploy you can measure.
+#     --protocols recommended | core | all | <comma list of keys and families>
+#     no --protocols on an interactive run  ->  a full-screen checkbox picker
+#                           (arrow keys, space to tick, f for a whole family)
+#
+#  The generated client config has ONE proxy group, of type select, holding
+#  every node. There is no url-test or fallback group anywhere in it: a
+#  health-checked group is the only thing that puts packets on the wire while
+#  you are sending none, and one dial per node per interval to a single IP
+#  across dozens of ports is the pattern this whole script exists to avoid.
+#  Nothing fails over for you; you pick another node.
+#
 #  Subcommands:
 #     ./Mihomo_Deployment.sh                deploy (interactive, sane defaults)
 #     ./Mihomo_Deployment.sh info           reprint links / subscription / creds
@@ -127,7 +151,11 @@ AMD64_LEVEL="auto"            # auto | v1 | v2 | v3   (see _amd64_level)
 CERT_MODE="letsencrypt"       # letsencrypt | self
 LE_EMAIL=""
 
-PROTO_CHOICE="all"
+# Default is 'sampler': exactly one listener per base protocol. A first deploy
+# should be something you can reason about and measure, not 81 sockets — pick
+# the winner on your own path, then re-deploy with --protocols <that key>.
+PROTO_CHOICE="sampler"
+PROTO_CHOICE_SET="no"         # yes once --protocols is seen, which skips the picker
 SELECTED=""
 
 LISTEN_ADDR="::"              # bare IP only; '::' is dual-stack, '0.0.0.0' v4-only
@@ -184,8 +212,27 @@ DECOY_RESOLVED=""             # steal | local, decided in setup_decoy
 # short record to a uniform floor, which is itself a signature; it is only worth
 # setting if you have measured genuinely short records on your own path.
 RESTLS_MIN_RECORD_LEN="0"
-PROBE_INTERVAL="60"           # client url-test interval, seconds
-PROBE_TIMEOUT="3000"          # client health-check timeout, ms
+# --- client TUN MTU ----------------------------------------------------------
+# The size of the packets your applications hand to the tunnel, and the one
+# number that decides whether a session "connects but will not load pages".
+#
+# 1280 is the IPv6 minimum every network is required to carry, so it survives
+# PPPoE (1492), mobile GTP encapsulation (~1400 on MCI/MTN), CGNAT and hotel
+# Wi-Fi without retuning per network. mihomo's own default is 9000, which
+# assumes a path that will fragment or report back; this path does neither.
+#
+# It matters more here than elsewhere because the failure is SILENT. Iranian
+# carriers suppress the ICMP "fragmentation needed" reply that Path MTU
+# Discovery needs, so an over-large MTU is not corrected — packets above the
+# real limit simply vanish. Handshakes and DNS fit and succeed, which is why the
+# client shows "connected"; TLS records and QUIC datagrams do not, which is why
+# pages hang half-loaded and image-heavy apps crawl. Under-declaring costs ~4%
+# of throughput. Over-declaring costs the session.
+#
+# This is the INNER packet size and is unrelated to --kcp-mtu, which sizes the
+# outer UDP datagram mKCP/kcp-tun put on the wire. Lower one and the other does
+# not follow. `mihomoctl pmtu <host>` measures both.
+CLIENT_MTU="1280"
 # TCP Brutal is a FIXED-RATE congestion control: it ignores loss by design. On a
 # path where loss is frequently the censor rather than the network, that turns
 # every loss event into a sustained burst — and a sudden burst is one of the
@@ -207,6 +254,7 @@ SUB_TOKEN=""
 
 ASSUME_YES="no"
 SKIP_PREFLIGHT="no"
+TUI_ENABLED="yes"             # --no-picker forces the plain typed prompt
 NIC=""
 
 MH_USER="mihomo"
@@ -438,6 +486,40 @@ build_catalogue
 readonly RECOMMENDED_KEYS="vless-tcp-reality vless-ws-tls vless-grpc-reality vless-xhttp-reality vmess-ws-tls trojan-tcp-tls anytls-tls ss-plain snell-plain hysteria2 hysteria2-obfs tuic shadowquic sudoku"
 # The "classic" set, i.e. what the sing-box / Xray scripts also offer.
 readonly CORE_KEYS="vless-tcp-reality vless-ws-tls vmess-ws-tls trojan-tcp-tls anytls-tls ss-plain hysteria2 tuic"
+
+# --- 'sampler': exactly ONE listener per base protocol ------------------------
+# The tuning set, and the default. 'recommended' and 'core' both weight towards
+# VLESS because that is what is popular; neither answers the question you
+# actually have on a censored path, which is "which of these families still
+# passes traffic here at all". One node per family, each the least exotic member
+# of its family so a failure is the family's fault and not a transport's, gives
+# you that in one deploy — then re-deploy with --protocols <winner> and spend the
+# ports on variants of the thing that worked.
+#
+# The preference list names the member to use; it is not the source of truth for
+# WHICH families exist. Anything in the catalogue that the list does not cover is
+# picked up below, so a protocol added upstream cannot go missing from the one
+# preset that claims to cover everything.
+readonly SAMPLER_PREFERRED="vless-tcp-reality vmess-ws-tls trojan-tcp-tls anytls-tls ss-plain snell-plain hysteria2 tuic shadowquic mieru-tcp sudoku trusttunnel-tcp"
+
+build_sampler() {
+  local out=() seen=" " k b
+  for k in $SAMPLER_PREFERRED; do
+    [[ -n ${K_BASE[$k]:-} ]] || continue        # preference names a key that no longer exists
+    b="${K_BASE[$k]}"
+    [[ $seen == *" $b "* ]] && continue
+    out+=("$k"); seen+="$b "
+  done
+  for k in "${ALL_KEYS[@]}"; do
+    b="${K_BASE[$k]}"
+    # realm is the hysteria2 rendezvous endpoint, not a proxy you can dial.
+    [[ $b == realm ]] && continue
+    [[ $seen == *" $b "* ]] && continue
+    out+=("$k"); seen+="$b "
+  done
+  printf '%s' "${out[*]}"
+}
+readonly SAMPLER_KEYS="$(build_sampler)"
 
 # --- derived per-key properties ----------------------------------------------
 # L4 a key listens on. QUIC and mkcp/kcptun are UDP; shadowsocks and snell keep
@@ -795,7 +877,7 @@ save_state() {
              API_LISTEN API_SECRET \
              AUTO_PORTS KERNEL_TUNING FIREWALL METERING SUB_HOST SUB_PORT SUB_TOKEN NIC \
              SRV_UP_MBPS SRV_DOWN_MBPS CLI_DOWN_MBPS CLI_UP_MBPS PATH_RTT_MS PATH_LOSS_PCT \
-             KCP_MTU MKCP_TTI BRUTAL PROBE_INTERVAL PROBE_TIMEOUT \
+             KCP_MTU MKCP_TTI BRUTAL CLIENT_MTU \
              DECOY_MODE DECOY_PORT DECOY_RESOLVED DECOY_ALPN \
              RESTLS_MIN_RECORD_LEN RESTLS_VERSION_HINT RESTLS_SCRIPT_S RESTLS_SCRIPT_C KCPTUN_KEY \
              MH_USER MH_VERSION \
@@ -888,7 +970,8 @@ Subcommands:
   update                 upgrade mihomo to the newest build in the chosen channel
   regen-sub              rebuild client bundles from saved state
   amplification          wire bytes vs payload bytes per listener; --reset zeroes it
-  pmtu <host>            largest unfragmented UDP payload to <host>; sizes --kcp-mtu
+  pmtu <host>            largest unfragmented UDP payload to <host>; sizes both
+                         --kcp-mtu (outer datagram) and --mtu (client TUN)
   uninstall              remove configuration
 
 Common options:
@@ -902,13 +985,23 @@ Common options:
                                GOAMD64 build to fetch. 'auto' probes /proc/cpuinfo;
                                the plain 'amd64' asset upstream is a v3 build and
                                SIGILLs on pre-Haswell CPUs, hence this flag.
-      --protocols <all|recommended|core|list>
+      --protocols <sampler|recommended|core|all|list>
+                               'sampler' (the default) = exactly one listener per
+                               base protocol, so a first deploy is something you
+                               can measure rather than 81 sockets. Find the family
+                               that survives your path, then re-deploy with
+                               --protocols <that key> and spend the ports on its
+                               variants.
                                'all' = every valid combination (${#ALL_KEYS[@]} listeners)
                                a list may name keys, families (vless, vmess, trojan,
                                anytls, ss, snell, quic, exotic) or security layers
                                (reality, shadowtls, restls, jls, tls).
                                A family name that is also a key ('hysteria2',
                                'sudoku') expands to the whole family.
+                               Omit this flag on an interactive run and you get a
+                               checkbox picker instead.
+      --no-picker              skip the full-screen settings menu and the protocol
+                               picker; ask everything as one-line prompts instead
       --listen <addr>          bare IP the listeners bind (default: ${LISTEN_ADDR})
       --cert-mode <letsencrypt|self>
       --le-email <email>
@@ -954,7 +1047,13 @@ Common options:
       --loss-pct <n>           default ${PATH_LOSS_PCT} (guides the FEC ratio only)
       --kcp-mtu <n>            default ${KCP_MTU}; QUIC's safe-datagram floor
       --mkcp-tti <n>           default ${MKCP_TTI} ms; must divide 1000 exactly
-      --probe-interval <n>     client health-check interval, s (default ${PROBE_INTERVAL})
+      --mtu <n>                client TUN MTU (default ${CLIENT_MTU}, 576..9000).
+                               1280 is the IPv6 minimum, so it is carried by every
+                               network — PPPoE, mobile GTP, CGNAT — without
+                               retuning. Set it too high and nothing reports the
+                               error: the tunnel connects, handshakes and DNS
+                               succeed, and every full-size packet is dropped in
+                               silence. 'mihomoctl pmtu <host>' measures it.
       --brutal | --no-brutal   TCP Brutal over smux. Off by default: it is a
                                fixed-rate sender that ignores loss, and on a path
                                where loss is often the censor rather than
@@ -989,7 +1088,8 @@ parse_args() {
       --channel)          INSTALL_CHANNEL="$2"; shift 2 ;;
       --version)          PIN_VERSION="$2"; INSTALL_CHANNEL="pinned"; shift 2 ;;
       --amd64-level)      AMD64_LEVEL="$2"; shift 2 ;;
-      --protocols)        PROTO_CHOICE="$2"; shift 2 ;;
+      --protocols)        PROTO_CHOICE="$2"; PROTO_CHOICE_SET="yes"; shift 2 ;;
+      --no-picker)        TUI_ENABLED="no"; shift ;;
       --listen)           LISTEN_ADDR="$2"; shift 2 ;;
       --cert-mode)        CERT_MODE="$2"; shift 2 ;;
       --le-email)         LE_EMAIL="$2"; shift 2 ;;
@@ -1012,7 +1112,7 @@ parse_args() {
       --mkcp-tti)         MKCP_TTI="$2"; shift 2 ;;
       --restls-script)    RESTLS_SCRIPT_S="$2"; RESTLS_SCRIPT_C="$2"; shift 2 ;;
       --restls-min-record-len) RESTLS_MIN_RECORD_LEN="$2"; shift 2 ;;
-      --probe-interval)   PROBE_INTERVAL="$2"; shift 2 ;;
+      --mtu)              CLIENT_MTU="$2"; shift 2 ;;
       --brutal)           BRUTAL="yes"; shift ;;
       --no-brutal)        BRUTAL="no"; shift ;;
       --firewall)         FIREWALL="$2"; shift 2 ;;
@@ -1036,6 +1136,8 @@ _expand_token() {
   local tok=$1 k out=()
   case "$tok" in
     all|"*")        printf '%s\n' "${ALL_KEYS[@]}"; return 0 ;;
+    sampler|one-of-each|oneofeach|each)
+                    printf '%s\n' $SAMPLER_KEYS; return 0 ;;
     recommended|rec) printf '%s\n' $RECOMMENDED_KEYS; return 0 ;;
     core|classic)   printf '%s\n' $CORE_KEYS; return 0 ;;
     # families by base protocol
@@ -1067,6 +1169,20 @@ _expand_token() {
 # The link profile drives every window in the config, so a typo here is a
 # silently mis-tuned deployment rather than an error. Bound it instead.
 _valid_num() { [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 )); }
+# 576 is IPv4's guaranteed-reassembly floor; 9000 is mihomo's own tun default and
+# the largest value any jumbo-frame path could justify.
+valid_client_mtu() { _valid_num "$1" 576 9000; }
+valid_ipv4_blank() { [[ -z $1 ]] || valid_ipv4 "$1"; }
+# Blank is a legal answer: collect_config derives the label from the domain.
+# With the strict valid_label here instead, the typed walk asks for a label
+# before any default exists, rejects the empty line ten times and dies.
+valid_label_blank() { [[ -z $1 ]] || valid_label "$1"; }
+valid_pct()        { _valid_num "$1" 0 100; }
+valid_kcp_mtu()    { _valid_num "$1" 576 1500; }
+valid_restls_len() { _valid_num "$1" 0 16384; }
+valid_tag_blank()  { [[ -z $1 ]] || valid_tag "$1"; }
+# '' switches the RESTful controller off entirely, which is a legal answer.
+valid_api_listen() { [[ -z $1 ]] || [[ $1 =~ ^([0-9.]+|\[[0-9a-fA-F:]+\]):[0-9]{1,5}$ ]]; }
 # Strip leading zeros in place. _valid_num forces base 10 for its own comparison,
 # but every consumer downstream does bare arithmetic — and bash reads a leading
 # zero as octal, so "060" would silently become 48 Mbit/s and "08" would abort
@@ -1082,8 +1198,8 @@ _denorm_zeros() {
 }
 validate_tunables() {
   _denorm_zeros CLI_DOWN_MBPS CLI_UP_MBPS SRV_UP_MBPS SRV_DOWN_MBPS PATH_RTT_MS \
-                PATH_LOSS_PCT KCP_MTU MKCP_TTI DECOY_PORT PROBE_INTERVAL \
-                PROBE_TIMEOUT RESTLS_MIN_RECORD_LEN
+                PATH_LOSS_PCT KCP_MTU MKCP_TTI DECOY_PORT \
+                RESTLS_MIN_RECORD_LEN CLIENT_MTU
   _valid_num "$CLI_DOWN_MBPS" 1 10000  || die "--client-down-mbps must be 1..10000 (got '${CLI_DOWN_MBPS}')."
   _valid_num "$CLI_UP_MBPS"   1 10000  || die "--client-up-mbps must be 1..10000 (got '${CLI_UP_MBPS}')."
   _valid_num "$SRV_UP_MBPS"   1 100000 || die "--server-up-mbps must be 1..100000 (got '${SRV_UP_MBPS}')."
@@ -1092,7 +1208,7 @@ validate_tunables() {
   _valid_num "$PATH_LOSS_PCT" 0 100    || die "--loss-pct must be 0..100 (got '${PATH_LOSS_PCT}')."
   _valid_num "$KCP_MTU"       576 1500 || die "--kcp-mtu must be 576..1500 (got '${KCP_MTU}')."
   _valid_num "$DECOY_PORT"    1 65535  || die "--decoy-port must be 1..65535 (got '${DECOY_PORT}')."
-  _valid_num "$PROBE_INTERVAL" 10 3600 || die "--probe-interval must be 10..3600 (got '${PROBE_INTERVAL}')."
+  valid_client_mtu "$CLIENT_MTU" || die "--mtu must be 576..9000 (got '${CLIENT_MTU}')."
   # 0 means "omit the key and let the server use its built-in 15"; 16384 is the
   # TLS record ceiling. Unvalidated, a non-numeric value reaches the `(( ... > 0 ))`
   # guard in _sec_block and aborts the deploy part-way through writing config.yaml.
@@ -1108,6 +1224,9 @@ validate_tunables() {
   fi
   # Not fatal, but almost always a mistake worth saying out loud.
   (( 10#$CLI_UP_MBPS > 25 )) && warn "--client-up-mbps ${CLI_UP_MBPS} is above the Iranian mobile median (~12 Mbps); over-declaring the uplink is what turns a loss event into a burst."
+  # An MTU above the Ethernet payload is only reachable on a path that carries
+  # jumbo frames end to end. Everywhere else it is the silent-blackhole setting.
+  (( 10#$CLIENT_MTU > 1500 )) && warn "--mtu ${CLIENT_MTU} is above 1500; unless you control the whole path, packets over the real limit will be dropped with no ICMP to tell the client why."
 
   # Say once, here, what _mkcp_cap has to stay silent about: this profile asks
   # for a window mihomo's uint32 arithmetic cannot express, so it is clamped and
@@ -1198,45 +1317,330 @@ review_ports() {
 }
 
 # -----------------------------------------------------------------------------
-# 5. Interactive configuration
+# 4b. Interactive protocol picker — radio presets, then a checkbox catalogue
 # -----------------------------------------------------------------------------
-collect_config() {
-  head1 "Configuration"
-  echo "Press ENTER to accept the value in brackets."
-  echo
+# Every escape sequence and every keystroke here goes through /dev/tty rather
+# than stdin/stdout. start_logging has already replaced stdout with a pipe into
+# `tee`, so a full-screen redraw written to stdout would be appended to the log
+# file and never reach the terminal — and the cursor-position codes would corrupt
+# the log while they were at it. The rest of this script's prompts use /dev/tty
+# for the same reason; this is not a special case.
 
-  local ip_hint="auto-detected if left blank" detected=""
-  detected="$(detect_public_ip || true)"
-  [[ -n $detected ]] && ip_hint="detected: ${detected}"
+TUI_ROWS=24
+TUI_COLS=80
+TUI_PICK=""          # set by _tui_presets: a token, or 'custom'
 
-  ask_valid VPN_DOMAIN "Server domain name (FQDN clients connect to / cert CN)" "$VPN_DOMAIN" \
-    valid_domain "that does not look like a domain name" "required, e.g. vpn.example.com"
-  ask VPN_IP "Server public IPv4 (blank = auto-detect)" "$VPN_IP" "$ip_hint"
-  [[ -n $VPN_IP ]] || VPN_IP="$detected"
-  valid_ipv4 "$VPN_IP" || warn "Could not determine a valid public IPv4 (${VPN_IP:-none}); links will use the domain."
+# Box-drawing and marks. A terminal in a non-UTF-8 locale renders the round
+# marks as mojibake, which on a selection screen means you cannot tell what is
+# selected — so that case gets plain ASCII rather than a prettier guess.
+if [[ ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} == *[Uu][Tt][Ff]* ]]; then
+  TUI_RADIO_ON='(●)'; TUI_RADIO_OFF='( )'
+  TUI_BOX_ON='[✓]';   TUI_BOX_OFF='[ ]'
+  TUI_CUR='❯'
+else
+  TUI_RADIO_ON='(*)'; TUI_RADIO_OFF='( )'
+  TUI_BOX_ON='[x]';   TUI_BOX_OFF='[ ]'
+  TUI_CUR='>'
+fi
 
-  [[ -n $NODE_LABEL ]] || NODE_LABEL="${VPN_DOMAIN%%.*}"
-  ask_valid NODE_LABEL "Short label prefixed to every generated node name" "$NODE_LABEL" \
-    valid_label "letters, digits, dot, dash or underscore (max 32 chars)"
-
-  echo
-  echo "  ${C_BOLD}stable${C_RST} – the newest tagged release (currently ${MH_STABLE_FALLBACK}). Recommended."
-  echo "  ${C_BOLD}alpha${C_RST}  – the rolling Prerelease-Alpha build of the Alpha branch."
-  echo "           Its listener set is identical to stable today; it moves faster."
-  echo "  ${C_BOLD}pinned${C_RST} – an exact tag you name."
-  ask_choice INSTALL_CHANNEL "mihomo release channel" "$INSTALL_CHANNEL" stable alpha pinned
-  if [[ $INSTALL_CHANNEL == pinned ]]; then
-    ask_valid PIN_VERSION "Exact mihomo tag to install" "${PIN_VERSION:-$MH_STABLE_FALLBACK}" \
-      valid_tag "expected a tag like ${MH_STABLE_FALLBACK}"
+_tui_size() {
+  local sz
+  if sz="$(stty size </dev/tty 2>/dev/null)" && [[ $sz =~ ^[0-9]+[[:space:]]+[0-9]+$ ]]; then
+    TUI_ROWS="${sz%%[[:space:]]*}"; TUI_COLS="${sz##*[[:space:]]}"
+  else
+    TUI_ROWS=24; TUI_COLS=80
   fi
+  (( TUI_ROWS >= 14 && TUI_COLS >= 50 )) || return 1
+  return 0
+}
 
+# Refuse the full-screen path rather than half-drawing it: a picker that cannot
+# clear the screen or read a keypress is worse than the typed prompt, because it
+# looks like it is working.
+_tui_available() {
+  [[ $TUI_ENABLED == yes ]] || return 1
+  [[ $INTERACTIVE == yes && $ASSUME_YES == no ]] || return 1
+  [[ -r /dev/tty && -w /dev/tty ]] || return 1
+  [[ -n ${TERM:-} && $TERM != dumb && $TERM != unknown ]] || return 1
+  have stty || return 1
+  _tui_size || return 1
+  return 0
+}
+
+# 1049 is the alternate screen buffer: the picker gets a blank screen to itself
+# and, on the way out, the terminal restores whatever was there before — so the
+# answers already given above it (domain, label, channel) are still on screen
+# instead of having been cleared away by a full-screen redraw. A terminal
+# without the capability ignores the sequence and the picker still works,
+# because it clears before every draw anyway.
+_tui_enter() { printf '\e[?1049h\e[?25l' >/dev/tty; }
+_tui_leave() { printf '\e[?25h\e[?1049l\e[0m' >/dev/tty; }
+_tui_clear() { printf '\e[H\e[2J' >/dev/tty; }
+_tui_say()   { printf '%s\e[K\n' "$*" >/dev/tty; }
+
+# One keypress -> $KEY.
+#
+# Arrows and page keys arrive as multi-byte escape sequences, and every byte not
+# consumed by the read that started them leaks into the next read and registers
+# as a stray letter press. So: ESC, then two more bytes; and if the second of
+# those is a digit the sequence is the longer '\e[<n>~' form and there is one
+# final '~' still to drain. A bare ESC times out with nothing after it, which is
+# how cancel is distinguished from an arrow key.
+KEY=""
+_tui_key() {
+  local k rest="" tail=""
+  IFS= read -rsn1 k </dev/tty || return 1
+  if [[ $k == $'\e' ]]; then
+    # The wait for the rest of the sequence has to outlast the gap the network
+    # can put between the bytes of one keypress. This script is administered over
+    # SSH from the far end of the path it exists to serve, where 200 ms of jitter
+    # is unremarkable — and at a 50 ms cutoff an arrow key whose tail arrives late
+    # is read as a bare ESC, which is the cancel key. 250 ms is still well under
+    # the time anyone notices after pressing Escape deliberately.
+    IFS= read -rsn2 -t 0.25 rest </dev/tty || true
+    k+="$rest"
+    if [[ $k == $'\e['[0-9] ]]; then
+      IFS= read -rsn1 -t 0.25 tail </dev/tty || true
+      k+="$tail"
+    fi
+  fi
+  KEY="$k"
+  return 0
+}
+
+# Truncate to the terminal width so a long line cannot wrap and desynchronise
+# every row below it from the position the redraw thinks it is writing to.
+_tui_fit() {
+  local str=$1 w=$(( TUI_COLS - 1 ))
+  (( w > 10 )) || w=10
+  if (( ${#str} > w )); then printf '%s' "${str:0:$((w-1))}…"; else printf '%s' "$str"; fi
+}
+
+_tui_row() {   # _tui_row <is-cursor> <text>
+  local cur=$1; shift
+  if [[ $cur == yes ]]; then
+    printf ' %s%s %s%s\e[K\n' "$C_C" "$TUI_CUR" "$(_tui_fit "$*")" "$C_RST" >/dev/tty
+  else
+    printf '   %s\e[K\n' "$(_tui_fit "$*")" >/dev/tty
+  fi
+}
+
+# --- screen 1: which preset --------------------------------------------------
+_tui_presets() {
+  local -a tok=(sampler recommended core all custom)
+  local -a lbl=(
+    "sampler       one listener per protocol family"
+    "recommended   a curated spread of every distinct technique"
+    "core          the classics the sing-box / Xray scripts also offer"
+    "all           every valid combination in the catalogue"
+    "custom …      tick individual protocols on the next screen"
+  )
+  local -a cnt=(
+    "$(printf '%s' "$SAMPLER_KEYS" | wc -w)"
+    "$(printf '%s' "$RECOMMENDED_KEYS" | wc -w)"
+    "$(printf '%s' "$CORE_KEYS" | wc -w)"
+    "${#ALL_KEYS[@]}"
+    ""
+  )
+  local i cur=0 mark n
+  # Start on whatever --protocols / the saved state already says, so re-running
+  # a deploy does not silently move the answer.
+  for i in "${!tok[@]}"; do [[ ${tok[$i]} == "${PROTO_CHOICE,,}" ]] && cur=$i; done
+
+  while true; do
+    _tui_clear
+    _tui_say "${C_BOLD}Protocol selection${C_RST}"
+    _tui_say "${C_D}$(_tui_fit "${#ALL_KEYS[@]} valid combinations of base protocol x transport x security layer.")${C_RST}"
+    _tui_say ""
+    for i in "${!tok[@]}"; do
+      mark="$TUI_RADIO_OFF"; (( i == cur )) && mark="$TUI_RADIO_ON"
+      n=""; [[ -n ${cnt[$i]} ]] && n="  ${cnt[$i]} listener(s)"
+      _tui_row "$( ((i==cur)) && echo yes || echo no )" "${mark} ${lbl[$i]}${n}"
+    done
+    _tui_say ""
+    _tui_say "${C_D}$(_tui_fit "up/down move   enter choose   e edit this set as a checklist   q cancel")${C_RST}"
+
+    _tui_key || return 1
+    case "$KEY" in
+      $'\e[A'|k|K) cur=$(( cur > 0 ? cur - 1 : ${#tok[@]} - 1 )) ;;
+      $'\e[B'|j|J) cur=$(( (cur + 1) % ${#tok[@]} )) ;;
+      "")          TUI_PICK="${tok[$cur]}"; return 0 ;;
+      e|E)         TUI_PICK="edit:${tok[$cur]}"; return 0 ;;
+      q|Q|$'\e')   return 1 ;;
+    esac
+  done
+}
+
+# --- screen 2: tick individual protocols -------------------------------------
+# Returns 0 with PROTO_CHOICE set to a comma list, 1 if cancelled.
+_tui_checklist() {   # _tui_checklist <space separated keys to pre-tick>
+  local preset=$1
+  local -a rows=() keys=()
+  local -A checked=()
+  local k b mk last="" i
+
+  for k in "${ALL_KEYS[@]}"; do
+    b="${K_BASE[$k]}"
+    [[ $b == "$last" ]] || { rows+=("H:$b"); last="$b"; }
+    rows+=("K:$k"); keys+=("$k")
+  done
+  for k in $preset; do [[ -n ${K_BASE[$k]:-} ]] && checked[$k]=1; done
+
+  local cur=0 top=0 view n_sel note=""
+  # Header is 4 lines, footer 3; the rest is list. Never smaller than 5 rows or
+  # the cursor has nowhere to move and paging stops making sense.
+  view=$(( TUI_ROWS - 8 )); (( view >= 5 )) || view=5
+
+  # Land the cursor on the first tickable row, never on a family header.
+  while (( cur < ${#rows[@]} )) && [[ ${rows[$cur]} == H:* ]]; do cur=$((cur+1)); done
+
+  _tui_move() {   # _tui_move <+1|-1>  — step over headers, stop at the ends
+    local step=$1 n=$cur
+    while true; do
+      n=$(( n + step ))
+      (( n >= 0 && n < ${#rows[@]} )) || return 0
+      if [[ ${rows[$n]} == K:* ]]; then cur=$n; return 0; fi
+    done
+  }
+
+  while true; do
+    (( cur < top )) && top=$cur
+    (( cur >= top + view )) && top=$(( cur - view + 1 ))
+    (( top < 0 )) && top=0
+
+    n_sel=0; for k in "${!checked[@]}"; do n_sel=$((n_sel+1)); done
+
+    _tui_clear
+    _tui_say "${C_BOLD}Protocols${C_RST}  ${C_D}${n_sel} of ${#keys[@]} ticked${C_RST}"
+    if [[ -n $note ]]; then _tui_say "${C_Y}${note}${C_RST}"; note=""; else _tui_say ""; fi
+    _tui_say "${C_D}$(_tui_fit "$( (( top > 0 )) && printf '↑ more above' || printf ' ' )")${C_RST}"
+
+    for (( i = top; i < top + view; i++ )); do
+      if (( i >= ${#rows[@]} )); then _tui_say ""; continue; fi
+      if [[ ${rows[$i]} == H:* ]]; then
+        printf '   %s%s%s\e[K\n' "$C_D" "$(_tui_fit "── ${rows[$i]#H:}")" "$C_RST" >/dev/tty
+      else
+        k="${rows[$i]#K:}"
+        mk="$TUI_BOX_OFF"; [[ -n ${checked[$k]:-} ]] && mk="$TUI_BOX_ON"
+        _tui_row "$( ((i==cur)) && echo yes || echo no )" \
+          "$(printf '%s %-26s %-4s %-10s %s' "$mk" "$k" "$(proto_l4 "$k")" \
+             "${K_XPORT[$k]}" "${K_SEC[$k]}")"
+      fi
+    done
+
+    _tui_say "${C_D}$(_tui_fit "$( (( top + view < ${#rows[@]} )) && printf '↓ more below' || printf ' ' )")${C_RST}"
+    _tui_say "${C_D}$(_tui_fit "space tick   f whole family   a all   n none   pgup/pgdn   enter done   q cancel")${C_RST}"
+
+    _tui_key || return 1
+    case "$KEY" in
+      $'\e[A'|k|K)  _tui_move -1 ;;
+      $'\e[B'|j|J)  _tui_move +1 ;;
+      $'\e[5~')     for ((i=0;i<view;i++)); do _tui_move -1; done ;;
+      $'\e[6~')     for ((i=0;i<view;i++)); do _tui_move +1; done ;;
+      $'\e[H'|g)    cur=0; while (( cur < ${#rows[@]} )) && [[ ${rows[$cur]} == H:* ]]; do cur=$((cur+1)); done ;;
+      $'\e[F'|G)    cur=$(( ${#rows[@]} - 1 )); while (( cur > 0 )) && [[ ${rows[$cur]} == H:* ]]; do cur=$((cur-1)); done ;;
+      ' ')
+        k="${rows[$cur]#K:}"
+        if [[ -n ${checked[$k]:-} ]]; then unset 'checked[$k]'; else checked[$k]=1; fi ;;
+      f|F)
+        # Tick or clear the whole family the cursor sits in — with 81 entries,
+        # "all the VLESS ones" is the selection people actually want to express.
+        b="${K_BASE[${rows[$cur]#K:}]}"
+        local any=no
+        for k in "${keys[@]}"; do
+          [[ ${K_BASE[$k]} == "$b" ]] || continue
+          [[ -n ${checked[$k]:-} ]] || any=yes
+        done
+        for k in "${keys[@]}"; do
+          [[ ${K_BASE[$k]} == "$b" ]] || continue
+          if [[ $any == yes ]]; then checked[$k]=1; else unset 'checked[$k]'; fi
+        done ;;
+      a|A)  for k in "${keys[@]}"; do checked[$k]=1; done ;;
+      n|N)  checked=() ;;
+      i|I)  for k in "${keys[@]}"; do
+              if [[ -n ${checked[$k]:-} ]]; then unset 'checked[$k]'; else checked[$k]=1; fi
+            done ;;
+      "")
+        local -a out=()
+        # Emit in catalogue order, not hash order, so the saved PROTO_CHOICE is
+        # stable across runs and diffable.
+        for k in "${keys[@]}"; do [[ -n ${checked[$k]:-} ]] && out+=("$k"); done
+        if (( ${#out[@]} == 0 )); then note="Tick at least one protocol, or press q to cancel."; continue; fi
+        PROTO_CHOICE="$(IFS=,; printf '%s' "${out[*]}")"
+        return 0 ;;
+      q|Q|$'\e')  return 1 ;;
+    esac
+  done
+}
+
+# A hand-ticked set that happens to equal a preset is stored as the preset name.
+# The alternative is an 81-key comma string in the state file and in --help
+# output, which is unreadable and re-expands to exactly the same thing.
+_tui_collapse() {
+  local want; want="$(printf '%s\n' ${PROTO_CHOICE//,/ } | sort | tr '\n' ' ')"
+  local name have
+  for name in sampler recommended core all; do
+    case "$name" in
+      sampler)     have="$SAMPLER_KEYS" ;;
+      recommended) have="$RECOMMENDED_KEYS" ;;
+      core)        have="$CORE_KEYS" ;;
+      all)         have="${ALL_KEYS[*]}" ;;
+    esac
+    if [[ "$(printf '%s\n' $have | sort | tr '\n' ' ')" == "$want" ]]; then
+      PROTO_CHOICE="$name"; return 0
+    fi
+  done
+  return 0
+}
+
+# The entry point collect_config calls. Falls back to the typed prompt whenever
+# the full-screen path is unavailable or cancelled, so there is always a way
+# through — including over a serial console or in CI.
+pick_protocols() {
+  # Nothing to ask in a non-interactive run, and the menu would only be noise in
+  # the deploy log.
+  if [[ $ASSUME_YES == yes || $INTERACTIVE == no ]]; then
+    echo
+    echo "  Protocols: ${PROTO_CHOICE}"
+    return 0
+  fi
+  if ! _tui_available; then
+    _pick_protocols_typed; return 0
+  fi
+  trap '_tui_leave' EXIT INT TERM
+  _tui_enter
+  local rc=0 pick=""
+  if _tui_presets; then
+    pick="$TUI_PICK"
+    case "$pick" in
+      custom)   _tui_checklist "$SAMPLER_KEYS" || rc=1 ;;
+      edit:*)   _tui_checklist "$(_expand_token "${pick#edit:}" | tr '\n' ' ')" || rc=1 ;;
+      *)        PROTO_CHOICE="$pick" ;;
+    esac
+  else
+    rc=1
+  fi
+  _tui_leave
+  trap - EXIT INT TERM
+  if (( rc != 0 )); then
+    echo "  Picker cancelled — falling back to the typed prompt."
+    _pick_protocols_typed
+    return 0
+  fi
+  _tui_collapse
+  return 0
+}
+
+# The original prompt, kept intact as the fallback path.
+_pick_protocols_typed() {
   echo
   echo "  Protocol selection. The catalogue holds ${#ALL_KEYS[@]} valid combinations of"
   echo "  base protocol x transport x security layer."
   echo
+  echo "    ${C_BOLD}sampler${C_RST}      one listener per protocol family ($(printf '%s' "$SAMPLER_KEYS" | wc -w) listeners) — the default"
+  echo "    ${C_BOLD}recommended${C_RST}  a curated $(printf '%s' "$RECOMMENDED_KEYS" | wc -w) that cover every distinct technique"
+  echo "    ${C_BOLD}core${C_RST}         the $(printf '%s' "$CORE_KEYS" | wc -w) classics also offered by the sing-box / Xray scripts"
   echo "    ${C_BOLD}all${C_RST}          every combination (${#ALL_KEYS[@]} listeners, ${#ALL_KEYS[@]} ports)"
-  echo "    ${C_BOLD}recommended${C_RST}  a curated 14 that cover every distinct technique"
-  echo "    ${C_BOLD}core${C_RST}         the 8 classics also offered by the sing-box / Xray scripts"
   echo
   echo "  Or a comma list of families and keys, e.g.:"
   echo "    reality,jls,hysteria2,shadowquic     vless,quic     vless-tcp-reality,tuic"
@@ -1244,90 +1648,406 @@ collect_config() {
   echo "            reality shadowtls restls jls tls ws grpc xhttp mkcp mekya kcptun"
   echo "  (run '$0 --list-protocols' for every key)"
   ask PROTO_CHOICE "Which protocols" "$PROTO_CHOICE"
-  resolve_selection
-  local n; n="$(selected_count)"
-  echo "  Selected: ${n} listener(s)."
-  if (( n > 40 )); then
-    warn "That is ${n} listening sockets and ${n} firewall openings on one host."
-    warn "It works, but 'recommended' is the saner default for a production node."
-  fi
+  return 0
+}
 
-  # --- certificate ---
-  if needs_any_cert; then
-    echo
-    echo "  ${C_BOLD}letsencrypt${C_RST} – real cert via certbot (needs the A record pointing here + port 80 free)."
-    echo "  ${C_BOLD}self${C_RST}        – self-signed; clients must allow insecure or pin the fingerprint."
-    ask_choice CERT_MODE "TLS certificate source" "$CERT_MODE" letsencrypt self
-    if [[ $CERT_MODE == letsencrypt ]]; then
-      ask_valid LE_EMAIL "Let's Encrypt contact e-mail (blank = register without one)" "$LE_EMAIL" \
-        valid_email "that does not look like an e-mail address"
+# -----------------------------------------------------------------------------
+# 4c. The settings table — one definition, two front ends
+# -----------------------------------------------------------------------------
+# Every tunable this script has is declared once, here. The full-screen menu and
+# the typed fallback both walk this table, so a parameter cannot be editable in
+# one and invisible in the other — which is exactly how the old linear prompt
+# ended up asking about eleven settings and silently defaulting twenty.
+#
+# _fld <var> <section> <type> <label> <validator|-> <choices|-> <hint>
+#   text  free text, checked by <validator>; '-' at the prompt clears it
+#   num   same, but the hint states the range
+#   enum  <choices> is a space-separated list; enter/left/right cycle it
+#   bool  yes/no, toggled with enter
+#   proto opens the protocol picker
+declare -a F_VAR=() F_SEC=() F_TYPE=() F_LABEL=() F_VALID=() F_CHOICE=() F_HINT=()
+
+_fld() {
+  F_VAR+=("$1"); F_SEC+=("$2"); F_TYPE+=("$3"); F_LABEL+=("$4")
+  F_VALID+=("$5"); F_CHOICE+=("$6"); F_HINT+=("$7")
+}
+
+readonly SS_CIPHERS="2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305 aes-128-gcm aes-256-gcm chacha20-ietf-poly1305"
+
+build_fields() {
+  F_VAR=(); F_SEC=(); F_TYPE=(); F_LABEL=(); F_VALID=(); F_CHOICE=(); F_HINT=()
+
+  _fld VPN_DOMAIN  "Server identity" text "Domain (FQDN)"        valid_domain - \
+       "the name clients dial, and the certificate CN. Required."
+  _fld VPN_IP      "Server identity" text "Public IPv4"          valid_ipv4_blank - \
+       "blank auto-detects. Share links use it when the domain is not resolvable yet."
+  _fld NODE_LABEL  "Server identity" text "Node label"           valid_label_blank - \
+       "prefix on every generated node name. Blank derives it from the domain."
+
+  _fld INSTALL_CHANNEL "mihomo build" enum "Release channel"     - "stable alpha pinned" \
+       "alpha is the rolling Prerelease-Alpha build; same listener set, moves faster."
+  _fld PIN_VERSION     "mihomo build" text "Pinned tag"          valid_tag_blank - \
+       "exact tag for the pinned channel, e.g. ${MH_STABLE_FALLBACK}"
+  _fld AMD64_LEVEL     "mihomo build" enum "GOAMD64 level"       - "auto v1 v2 v3" \
+       "auto probes /proc/cpuinfo. The plain amd64 asset upstream is a v3 build and SIGILLs on pre-Haswell."
+
+  _fld PROTO_CHOICE "Protocols" proto "Selection"                - - \
+       "enter opens the picker: presets, or tick individual protocols"
+  _fld LISTEN_ADDR  "Protocols" text "Bind address"              valid_listen - \
+       "bare IP only. '::' is dual-stack, '0.0.0.0' is v4-only."
+  _fld AUTO_PORTS   "Protocols" bool "Auto-assign ports"         - - \
+       "no = confirm every listener's port by hand after this screen"
+
+  _fld CERT_MODE   "Certificate and camouflage" enum "Certificate source" - "letsencrypt self" \
+       "letsencrypt needs the A record pointing here and port 80 free"
+  _fld LE_EMAIL    "Certificate and camouflage" text "Let's Encrypt e-mail" valid_email - \
+       "blank registers without a contact address"
+  _fld REALITY_SNI "Certificate and camouflage" text "REALITY steal target" valid_domain - \
+       "a real, busy, external TLS 1.3 site that is NOT blocked where your clients are"
+  _fld DECOY_MODE  "Certificate and camouflage" enum "Camouflage destination" - "auto local steal" \
+       "local = a TLS site on loopback serving YOUR cert: SNI, cert and IP agree, and RestLS drops a round trip"
+  _fld DECOY_PORT  "Certificate and camouflage" num "Local decoy port" valid_port_num - \
+       "loopback port the local decoy nginx listens on, 1..65535"
+  _fld STEAL_SNI   "Certificate and camouflage" text "Decoy / masquerade site" valid_domain - \
+       "must stay reachable FROM THE SERVER, or the disguise fails open"
+  _fld RESTLS_MIN_RECORD_LEN "Certificate and camouflage" num "RestLS min record length" valid_restls_len - \
+       "0 leaves the server's built-in 15. A raised floor pads every short record to one size, which is itself a signature. 0..16384"
+
+  _fld SS_METHOD     "Protocol parameters" enum "Shadowsocks cipher" - "$SS_CIPHERS" \
+       "the 2022-blake3 ciphers are the ones with replay protection"
+  _fld SNELL_VERSION "Protocol parameters" enum "Snell version"      - "1 2 3 4" \
+       "mihomo's snell listener speaks v1 to v4"
+
+  _fld CLIENT_MTU "Client bundle" num "Client TUN MTU" valid_client_mtu - \
+       "1280 is the IPv6 minimum, so every network carries it. Too high fails SILENTLY: connects, then drops everything full-size. 576..9000"
+
+  _fld CLI_DOWN_MBPS "Link profile" num "Client download, Mbit/s" valid_mbps - \
+       "the client's REAL figure, rounded down — this sets your download window. 1..10000"
+  _fld CLI_UP_MBPS   "Link profile" num "Client upload, Mbit/s"   valid_mbps - \
+       "the expensive one to get wrong: over-declared, uploads queue and DNS queues behind them. 1..10000"
+  _fld SRV_UP_MBPS   "Link profile" num "Server uplink, Mbit/s"   valid_mbps - \
+       "this server's own port speed. 1..10000"
+  _fld SRV_DOWN_MBPS "Link profile" num "Server downlink, Mbit/s" valid_mbps - \
+       "this server's own port speed. 1..10000"
+  _fld PATH_RTT_MS   "Link profile" num "Path RTT, ms"            valid_ms - \
+       "round trip to the clients. Iran to Frankfurt is 75-85 ms plus the access network. 1..2000"
+  _fld PATH_LOSS_PCT "Link profile" num "Path loss, %"            valid_pct - \
+       "healthy-path loss. Drives the FEC ratio only. 0..100"
+  _fld KCP_MTU       "Link profile" num "KCP datagram MTU"        valid_kcp_mtu - \
+       "the OUTER UDP datagram, unrelated to the client TUN MTU. 1200 is QUIC's safe floor. 576..1500"
+  _fld MKCP_TTI      "Link profile" enum "mKCP tick, ms"          - "10 20 25 40 50 100" \
+       "must divide 1000 exactly; mihomo truncates 1000/tti to an integer"
+  _fld BRUTAL        "Link profile" bool "TCP Brutal"             - - \
+       "fixed-rate congestion control that ignores loss by design. On a path where loss is the censor, that is a burst that gets the flow killed."
+
+  _fld API_LISTEN    "Host" text "RESTful controller" valid_api_listen - \
+       "ip:port for mihomo's API on THIS SERVER. '-' switches it off."
+  _fld FIREWALL      "Host" enum "Firewall backend" - "auto ufw iptables none" ""
+  _fld KERNEL_TUNING "Host" bool "Kernel / sysctl tuning" - - \
+       "BBR, QUIC socket buffers, fd limits, conntrack timeouts"
+  _fld METERING      "Host" bool "nftables byte counters" - - \
+       "feeds 'mihomoctl amplification' — wire bytes over payload bytes, per port"
+  _fld SUB_HOST      "Host" bool "Serve subscription over HTTP" - - \
+       "plain HTTP on a secret path, for clients that import by URL"
+  _fld SUB_PORT      "Host" num "Subscription port" valid_port_num - "1..65535"
+  return 0
+}
+build_fields
+
+# Rows whose value cannot matter given the rest of the answers are hidden rather
+# than shown greyed out: a setting you can see and change but that is never read
+# is worse than one that is absent, because it reads as having taken effect.
+_field_shown() {
+  case "$1" in
+    PIN_VERSION)           [[ $INSTALL_CHANNEL == pinned ]] ;;
+    CERT_MODE)             needs_any_cert ;;
+    LE_EMAIL)              needs_any_cert && [[ $CERT_MODE == letsencrypt ]] ;;
+    REALITY_SNI)           _sec_used reality ;;
+    DECOY_MODE)            uses_decoy ;;
+    DECOY_PORT)            uses_decoy && [[ $DECOY_MODE != steal ]] ;;
+    STEAL_SNI)             uses_decoy || uses_steal_site ;;
+    RESTLS_MIN_RECORD_LEN) _sec_used restls ;;
+    SS_METHOD)             _base_used ss ;;
+    SNELL_VERSION)         _base_used snell ;;
+    KCP_MTU)               _xport_used mkcp || _xport_used kcptun ;;
+    MKCP_TTI)              _xport_used mkcp ;;
+    BRUTAL)                _muxable_any ;;
+    SUB_PORT)              [[ $SUB_HOST == yes ]] ;;
+    *)                     return 0 ;;
+  esac
+}
+
+# What the row shows on the right. A blank that MEANS something gets said out
+# loud, so an empty column never has to be guessed at.
+# NOTE the split declaration, here and in _menu_edit. `local v=$1 raw="${!v}"`
+# does NOT work: bash expands every word of the command before performing any of
+# its assignments, so `${!v}` reads the CALLER's v, not $1. Both functions are
+# called from a render loop that leaves its own v/i lying around, so the bug is
+# silent and picks a plausible-looking wrong field.
+_field_value() {
+  local v=$1
+  local raw="${!v}"
+  case "$v" in
+    PROTO_CHOICE)          printf '%s  (%s listeners)' "$raw" "$(selected_count)" ;;
+    VPN_IP)                printf '%s' "${raw:-<auto-detect>}" ;;
+    NODE_LABEL)            printf '%s' "${raw:-<from the domain>}" ;;
+    LE_EMAIL)              printf '%s' "${raw:-<none>}" ;;
+    API_LISTEN)            printf '%s' "${raw:-<disabled>}" ;;
+    PIN_VERSION)           printf '%s' "${raw:-<unset>}" ;;
+    RESTLS_MIN_RECORD_LEN) [[ $raw == 0 ]] && printf '0  (server default, 15)' || printf '%s' "$raw" ;;
+    VPN_DOMAIN)            printf '%s' "${raw:-<required>}" ;;
+    *)                     printf '%s' "${raw:-<blank>}" ;;
+  esac
+}
+
+_enum_cycle() {   # _enum_cycle <var> <choices> <+1|-1>
+  local v=$1 choices=$2 dir=$3
+  local -a c=($choices); local i cur=0
+  for i in "${!c[@]}"; do [[ ${c[$i]} == "${!v}" ]] && cur=$i; done
+  cur=$(( (cur + dir + ${#c[@]}) % ${#c[@]} ))
+  printf -v "$v" '%s' "${c[$cur]}"
+}
+
+# -----------------------------------------------------------------------------
+# 4d. The settings menu
+# -----------------------------------------------------------------------------
+# Everything is on one screen with its current value, rather than asked as a
+# thirty-question interrogation you cannot go back in. Enter edits the row under
+# the cursor; d deploys.
+settings_menu() {
+  local -a rows=()
+  local i v sec last note="" cur=0 top=0 view
+
+  _menu_rebuild() {
+    # Recomputed after every edit: changing the protocol selection or the
+    # certificate mode changes which rows exist at all.
+    rows=(); last=""
+    for i in "${!F_VAR[@]}"; do
+      _field_shown "${F_VAR[$i]}" || continue
+      [[ ${F_SEC[$i]} == "$last" ]] || { rows+=("H:${F_SEC[$i]}"); last="${F_SEC[$i]}"; }
+      rows+=("F:$i")
+    done
+    rows+=("H:") ; rows+=("A:deploy")
+  }
+
+  _menu_step() {   # skip header rows
+    local step=$1 n=$cur
+    while true; do
+      n=$(( n + step ))
+      (( n >= 0 && n < ${#rows[@]} )) || return 0
+      [[ ${rows[$n]} == H:* ]] || { cur=$n; return 0; }
+    done
+  }
+
+  # Read one line with the cursor and echo back on, then restore raw-ish mode.
+  _menu_read_line() {   # _menu_read_line <prompt> -> $REPLY_LINE
+    local prompt=$1
+    REPLY_LINE=""
+    printf '\e[?25h' >/dev/tty
+    printf '\n %s%s%s ' "$C_C" "$prompt" "$C_RST" >/dev/tty
+    IFS= read -r REPLY_LINE </dev/tty || REPLY_LINE=""
+    printf '\e[?25l' >/dev/tty
+    return 0
+  }
+
+  _menu_edit() {   # _menu_edit <field index>
+    local i=$1
+    local v="${F_VAR[$i]}" t="${F_TYPE[$i]}" fn="${F_VALID[$i]}" new=""
+    case "$t" in
+      bool)  [[ ${!v} == yes ]] && printf -v "$v" 'no' || printf -v "$v" 'yes' ;;
+      enum)  _enum_cycle "$v" "${F_CHOICE[$i]}" 1 ;;
+      proto)
+        if _tui_presets; then
+          case "$TUI_PICK" in
+            custom) _tui_checklist "$SAMPLER_KEYS" && _tui_collapse || true ;;
+            edit:*) _tui_checklist "$(_expand_token "${TUI_PICK#edit:}" | tr '\n' ' ')" && _tui_collapse || true ;;
+            *)      PROTO_CHOICE="$TUI_PICK" ;;
+          esac
+          resolve_selection
+        fi ;;
+      text|num)
+        _menu_read_line "${F_LABEL[$i]} [${!v}] ('-' clears):"
+        new="$REPLY_LINE"
+        [[ -z $new ]] && return 0            # empty line = leave it alone
+        [[ $new == '-' ]] && new=""          # an explicit clear
+        if [[ $fn != '-' ]] && ! "$fn" "$new"; then
+          note="Not valid for ${F_LABEL[$i]} — ${F_HINT[$i]}"
+          return 0
+        fi
+        printf -v "$v" '%s' "$new" ;;
+    esac
+    return 0
+  }
+
+  _tui_size || true
+  build_fields
+  _menu_rebuild
+  while (( cur < ${#rows[@]} )) && [[ ${rows[$cur]} == H:* ]]; do cur=$((cur+1)); done
+  view=$(( TUI_ROWS - 9 )); (( view >= 6 )) || view=6
+
+  while true; do
+    (( cur < top )) && top=$cur
+    (( cur >= top + view )) && top=$(( cur - view + 1 ))
+    (( top < 0 )) && top=0
+
+    _tui_clear
+    _tui_say "${C_BOLD}mihomo deployment settings${C_RST}   ${C_D}$(selected_count) listener(s)${C_RST}"
+    if [[ -n $note ]]; then _tui_say "${C_Y}$(_tui_fit "$note")${C_RST}"; note=""
+    else                    _tui_say "${C_D}$(_tui_fit "Every setting this script has. Enter edits the highlighted row.")${C_RST}"; fi
+    _tui_say "${C_D}$(_tui_fit "$( (( top > 0 )) && printf '↑ more above' || printf ' ' )")${C_RST}"
+
+    for (( i = top; i < top + view; i++ )); do
+      if (( i >= ${#rows[@]} )); then _tui_say ""; continue; fi
+      case "${rows[$i]}" in
+        H:) _tui_say "" ;;
+        H:*) printf '   %s%s%s\e[K\n' "$C_D" "$(_tui_fit "── ${rows[$i]#H:}")" "$C_RST" >/dev/tty ;;
+        A:*) _tui_row "$( ((i==cur)) && echo yes || echo no )" "▸ Deploy with these settings" ;;
+        F:*)
+          v="${F_VAR[${rows[$i]#F:}]}"
+          _tui_row "$( ((i==cur)) && echo yes || echo no )" \
+            "$(printf '%-26s %s' "${F_LABEL[${rows[$i]#F:}]}" "$(_field_value "$v")")" ;;
+      esac
+    done
+
+    _tui_say "${C_D}$(_tui_fit "$( (( top + view < ${#rows[@]} )) && printf '↓ more below' || printf ' ' )")${C_RST}"
+    # The hint for the row under the cursor, so the explanation is where you are
+    # looking rather than in --help.
+    case "${rows[$cur]}" in
+      F:*) _tui_say "${C_D}$(_tui_fit "${F_HINT[${rows[$cur]#F:}]}")${C_RST}" ;;
+      *)   _tui_say "" ;;
+    esac
+    _tui_say "${C_D}$(_tui_fit "enter edit   ←/→ cycle a choice   d deploy   q cancel")${C_RST}"
+
+    _tui_key || return 1
+    case "$KEY" in
+      $'\e[A'|k|K) _menu_step -1 ;;
+      $'\e[B'|j|J) _menu_step +1 ;;
+      $'\e[5~')    for ((i=0;i<view;i++)); do _menu_step -1; done ;;
+      $'\e[6~')    for ((i=0;i<view;i++)); do _menu_step +1; done ;;
+      $'\e[H'|g)   cur=0; _menu_step +1; _menu_step -1 ;;
+      $'\e[F'|G)   cur=$(( ${#rows[@]} - 1 )) ;;
+      $'\e[C')     [[ ${rows[$cur]} == F:* ]] && { i="${rows[$cur]#F:}"
+                     case "${F_TYPE[$i]}" in
+                       enum) _enum_cycle "${F_VAR[$i]}" "${F_CHOICE[$i]}" 1 ;;
+                       bool) _menu_edit "$i" ;;
+                     esac; _menu_rebuild; } ;;
+      $'\e[D')     [[ ${rows[$cur]} == F:* ]] && { i="${rows[$cur]#F:}"
+                     case "${F_TYPE[$i]}" in
+                       enum) _enum_cycle "${F_VAR[$i]}" "${F_CHOICE[$i]}" -1 ;;
+                       bool) _menu_edit "$i" ;;
+                     esac; _menu_rebuild; } ;;
+      "")
+        case "${rows[$cur]}" in
+          A:*) _menu_done && return 0 || { note="$MENU_ERR"; } ;;
+          F:*) _menu_edit "${rows[$cur]#F:}"; _menu_rebuild ;;
+        esac ;;
+      d|D) _menu_done && return 0 || { note="$MENU_ERR"; } ;;
+      q|Q|$'\e') return 1 ;;
+    esac
+    (( cur < ${#rows[@]} )) || cur=$(( ${#rows[@]} - 1 ))
+    while (( cur > 0 )) && [[ ${rows[$cur]} == H:* ]]; do cur=$((cur-1)); done
+  done
+}
+
+# The one gate between the menu and a deploy: a domain that is not a domain
+# would otherwise fail eight steps later, after packages are installed.
+MENU_ERR=""
+_menu_done() {
+  MENU_ERR=""
+  if ! valid_domain "$VPN_DOMAIN"; then
+    MENU_ERR="A server domain is required before deploying — set it at the top."
+    return 1
+  fi
+  if [[ $INSTALL_CHANNEL == pinned ]] && ! valid_tag "$PIN_VERSION"; then
+    MENU_ERR="Channel is 'pinned' but no valid tag is set (expected e.g. ${MH_STABLE_FALLBACK})."
+    return 1
+  fi
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 5. Interactive configuration
+# -----------------------------------------------------------------------------
+# The typed fallback. Same table, same order, same conditionals — just asked one
+# line at a time, for a serial console, a dumb terminal or a tiny window.
+collect_config_typed() {
+  local i v t fn lastsec=""
+  for i in "${!F_VAR[@]}"; do
+    v="${F_VAR[$i]}"; t="${F_TYPE[$i]}"; fn="${F_VALID[$i]}"
+    _field_shown "$v" || continue
+    # The domain is asked first, so by the time the label comes round there is
+    # something to derive a default from — offer it rather than asking for a
+    # value the script is about to invent anyway.
+    [[ $v == NODE_LABEL && -z $NODE_LABEL ]] && NODE_LABEL="${VPN_DOMAIN%%.*}"
+    if [[ ${F_SEC[$i]} != "$lastsec" ]]; then
+      lastsec="${F_SEC[$i]}"
+      echo; printf '  %s%s%s\n' "$C_BOLD" "$lastsec" "$C_RST"
     fi
+    [[ -n ${F_HINT[$i]} ]] && printf '    %s%s%s\n' "$C_D" "${F_HINT[$i]}" "$C_RST"
+    case "$t" in
+      bool)  ask_yn "$v" "${F_LABEL[$i]}" "${!v}" ;;
+      enum)  ask_choice "$v" "${F_LABEL[$i]}" "${!v}" ${F_CHOICE[$i]} ;;
+      proto) _pick_protocols_typed; resolve_selection ;;
+      text|num)
+        if [[ $fn == '-' ]]; then
+          ask "$v" "${F_LABEL[$i]}" "${!v}"
+        else
+          ask_valid "$v" "${F_LABEL[$i]}" "${!v}" "$fn" "   not valid — ${F_HINT[$i]}"
+        fi ;;
+    esac
+  done
+  return 0
+}
+
+collect_config() {
+  head1 "Configuration"
+
+  # Environment-derived defaults are filled BEFORE either front end, so the menu
+  # opens showing the address it actually detected rather than an empty row the
+  # user has to guess is going to be filled in later.
+  local detected=""
+  detected="$(detect_public_ip || true)"
+  [[ -n $VPN_IP ]] || VPN_IP="$detected"
+  [[ -n $NODE_LABEL && -n $VPN_DOMAIN ]] || NODE_LABEL="${NODE_LABEL:-${VPN_DOMAIN%%.*}}"
+
+  if [[ $ASSUME_YES == yes || $INTERACTIVE == no ]]; then
+    : # everything comes from the command line and the defaults
+  elif _tui_available; then
+    trap '_tui_leave' EXIT INT TERM
+    _tui_enter
+    local rc=0
+    settings_menu || rc=1
+    _tui_leave
+    trap - EXIT INT TERM
+    (( rc == 0 )) || die "Aborted by user."
   else
-    CERT_MODE="self"
+    echo "Press ENTER to accept the value in brackets."
+    collect_config_typed
   fi
 
-  local k has_reality="no"
-  for k in $SELECTED; do [[ ${K_SEC[$k]} == reality ]] && has_reality="yes"; done
-  if [[ $has_reality == yes ]]; then
-    ask_valid REALITY_SNI "REALITY steal target (a real external TLS1.3 site)" "$REALITY_SNI" \
-      valid_domain "must be a hostname, e.g. www.microsoft.com"
-  fi
-  if uses_decoy; then
-    echo
-    echo "  ShadowTLS / RestLS / JLS forward every unauthenticated connection to a"
-    echo "  real TLS server, so an active prober sees that server and nothing else."
-    echo "  Which server is the choice:"
-    echo
-    echo "    ${C_BOLD}local${C_RST} – a TLS 1.3 site on loopback serving YOUR certificate."
-    echo "            SNI, certificate and IP all agree, and RestLS stops paying a"
-    echo "            round trip to a third party on every single connection."
-    echo "            Needs --cert-mode letsencrypt. Installs nginx."
-    echo "    ${C_BOLD}steal${C_RST} – relay to a third-party site. Their real certificate, but"
-    echo "            your clients then claim their hostname from your IP, and that"
-    echo "            disagreement is exactly what gets scored."
-    ask_choice DECOY_MODE "Camouflage destination" "$DECOY_MODE" auto local steal
-    resolve_decoy_mode
-    if ! _decoy_local; then
-      echo
-      echo "  Pick a busy TLS 1.3 host that is NOT blocked where your clients are,"
-      echo "  and ideally not the same one as the REALITY target."
-      ask_valid STEAL_SNI "Decoy site for the certificate-less layers" "$STEAL_SNI" \
-        valid_domain "must be a hostname, e.g. www.apple.com"
-    fi
-  fi
+  valid_domain "$VPN_DOMAIN" || die "A server domain is required (--domain vpn.example.com)."
+  [[ -n $NODE_LABEL ]] || NODE_LABEL="${VPN_DOMAIN%%.*}"
+  valid_ipv4 "$VPN_IP" || warn "Could not determine a valid public IPv4 (${VPN_IP:-none}); links will use the domain."
+  [[ $INSTALL_CHANNEL == pinned && -z $PIN_VERSION ]] && PIN_VERSION="$MH_STABLE_FALLBACK"
+  # Nothing in the selection wants a certificate and no local decoy needs one:
+  # asking certbot for one anyway would put a public DNS record and an ACME
+  # order behind a deployment that has no use for either.
+  needs_any_cert || CERT_MODE="self"
 
-  # --- link profile ---
-  # These are not cosmetic. mKCP and kcp-tun derive every window and buffer from
-  # them, and because those windows describe the LOCAL side of an asymmetric
-  # path, one set of numbers cannot be right for both ends. Getting the client
-  # uplink wrong is the expensive one: too large and every upload sits in a
-  # multi-second queue that DNS and ACKs then queue behind.
+  resolve_selection
+  validate_tunables
+  resolve_decoy_mode
+
   if _xport_used mkcp || _xport_used kcptun || _xport_used mekya; then
-    echo
-    echo "  ${C_BOLD}Link profile${C_RST} — mKCP and kcp-tun size their windows from these."
-    echo "  Give the CLIENT's real numbers, not the plan's headline figure, and"
-    echo "  round DOWN. An over-declared uplink does not go faster; it queues."
-    ask_valid CLI_DOWN_MBPS "Typical client DOWNLOAD, Mbit/s" "$CLI_DOWN_MBPS" \
-      valid_mbps "a whole number of Mbit/s, 1..10000"
-    ask_valid CLI_UP_MBPS   "Typical client UPLOAD, Mbit/s"   "$CLI_UP_MBPS" \
-      valid_mbps "a whole number of Mbit/s, 1..10000"
-    ask_valid PATH_RTT_MS   "Round-trip time to the clients, ms" "$PATH_RTT_MS" \
-      valid_ms "a whole number of milliseconds, 1..2000"
-    validate_tunables
-    printf '    -> %s packets in flight downstream, %s upstream (at mtu %s, tti %s)\n' \
-      "$(_pkts_down)" "$(_pkts_up)" "$KCP_MTU" "$MKCP_TTI"
+    printf '  %s-> %s packets in flight downstream, %s upstream (at mtu %s, tti %s)%s\n' \
+      "$C_D" "$(_pkts_down)" "$(_pkts_up)" "$KCP_MTU" "$MKCP_TTI" "$C_RST"
   fi
-
-  ask_valid LISTEN_ADDR "Address the listeners bind ('::' = dual-stack)" "$LISTEN_ADDR" \
-    valid_listen "must be a bare IP: '::', '0.0.0.0' or an IPv4 address"
-  ask_yn AUTO_PORTS "Auto-assign the first free curated port per listener" "$AUTO_PORTS"
-  ask_choice FIREWALL "Firewall backend" "$FIREWALL" auto ufw iptables none
-  ask_yn KERNEL_TUNING "Apply kernel/sysctl tuning (BBR, QUIC buffers, fd limits)" "$KERNEL_TUNING"
-  ask_yn SUB_HOST "Also serve the subscription over plain HTTP (secret path)" "$SUB_HOST"
-  [[ $SUB_HOST == yes ]] && ask_valid SUB_PORT "HTTP port for the subscription server" "$SUB_PORT" valid_port_num "1..65535"
 
   assign_ports
   review_ports
+
+  local has_reality="no" k
+  for k in $SELECTED; do [[ ${K_SEC[$k]} == reality ]] && has_reality="yes"; done
 
   echo
   hr
@@ -1335,6 +2055,7 @@ collect_config() {
   printf '  %-24s %s\n' "mihomo channel"  "$INSTALL_CHANNEL${PIN_VERSION:+ ($PIN_VERSION)}"
   printf '  %-24s %s\n' "Listeners"       "$(selected_count)"
   printf '  %-24s %s\n' "Bind address"    "$LISTEN_ADDR"
+  printf '  %-24s %s\n' "Client TUN MTU"  "$CLIENT_MTU"
   needs_any_cert && printf '  %-24s %s\n' "TLS certificate" "$CERT_MODE"
   [[ $has_reality == yes ]] && printf '  %-24s %s\n' "REALITY SNI" "$REALITY_SNI"
   uses_decoy && printf '  %-24s %s\n' "Camouflage decoy" \
@@ -1354,9 +2075,6 @@ collect_config() {
   return 0
 }
 
-# -----------------------------------------------------------------------------
-# 6. Pre-flight
-# -----------------------------------------------------------------------------
 detect_public_ip() {
   local u ip=""
   for u in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com"; do
@@ -3205,14 +3923,52 @@ do_pmtu() {
     bad "No DF-bit probe got through at any size; the path drops them or filters the reply."
     return 1
   fi
-  ok "Largest unfragmented payload: ${best} bytes  (path MTU $(( best + 28 )))"
+  local pmtu=$(( best + 28 ))
+  ok "Largest unfragmented payload: ${best} bytes  (path MTU ${pmtu})"
+
+  # Two different numbers come out of one measurement, because they sit on
+  # opposite sides of the encapsulation.
+  #
+  #   --kcp-mtu  is the OUTER UDP datagram mKCP / kcp-tun writes to the wire, so
+  #              it is the measured payload itself.
+  #   --mtu      is the INNER packet an application hands to the tunnel, so it
+  #              has to leave room for whatever wraps it. 80 bytes covers the
+  #              worst case here (IPv4 + UDP + QUIC long header + the AEAD tag
+  #              a hysteria2 / tuic / shadowquic datagram adds); TCP-based
+  #              nodes wrap it in less.
+  local mtu_fit=$(( pmtu - 80 ))
+  (( mtu_fit > 1500 )) && mtu_fit=1500
+  (( mtu_fit < 576 ))  && mtu_fit=576
+  echo
   printf '  %-30s %s\n' "safe --kcp-mtu" "$best"
-  printf '  %-30s %s\n' "currently configured"  "$KCP_MTU"
+  printf '  %-30s %s\n' "  currently configured" "$KCP_MTU"
+  printf '  %-30s %s\n' "safe --mtu (client TUN)" "$mtu_fit"
+  printf '  %-30s %s\n' "  currently configured" "$CLIENT_MTU"
+  echo
+
   if (( KCP_MTU > best )); then
     warn "--kcp-mtu ${KCP_MTU} exceeds this path's ${best}: every KCP packet fragments,"
     warn "and losing either fragment loses the whole packet. Re-deploy with --kcp-mtu ${best}."
   else
     ok "The configured --kcp-mtu fits this path with $(( best - KCP_MTU )) bytes to spare."
+  fi
+
+  if (( 10#$CLIENT_MTU > mtu_fit )); then
+    warn "--mtu ${CLIENT_MTU} is larger than this path carries (${mtu_fit} with encapsulation)."
+    warn "This is the failure that does not look like a failure: the tunnel comes up,"
+    warn "handshakes and DNS fit and succeed, and everything full-size disappears."
+    warn "Re-deploy with --mtu ${mtu_fit}, or --mtu 1280 if this client roams."
+  else
+    ok "The configured --mtu fits this path with $(( mtu_fit - 10#$CLIENT_MTU )) bytes to spare."
+  fi
+
+  # One path measured is not the same as the networks a phone actually moves
+  # between, and the client cannot re-measure when it changes.
+  if (( 10#$CLIENT_MTU > 1280 )); then
+    warn "Note that this measured ONE path. A client that roams between Wi-Fi and"
+    warn "mobile meets a different limit on each and gets no ICMP to discover it,"
+    warn "so --mtu 1280 (the IPv6 minimum, which every network must carry) is the"
+    warn "value that holds everywhere at a cost of roughly 4% throughput."
   fi
   return 0
 }
@@ -3891,13 +4647,82 @@ log-level: silent
 # The networks this deployment targets are IPv4-only; advertising IPv6 makes
 # every dual-stack dial wait out a dead AAAA path before falling back.
 ipv6: false
-unified-delay: true
+# unified-delay sends a SECOND HEAD request on every health check so the reported
+# latency excludes the handshake (adapter/adapter.go:259). That is a nicer number
+# and twice the probe traffic, and upstream itself warns against it on a plain
+# http:// test URL because many paths do not survive a repeated HEAD — which is
+# exactly the URL below. The ranking it buys is not worth doubling the one cost
+# this config pays even when you are sending no traffic at all.
+unified-delay: false
 # tcp-concurrent races one dial per resolved address and keeps them all alive
 # until the first wins. On mobile clients that multiplies sockets and FDs for
 # no gain when the node is a single pinned IPv4 address.
 tcp-concurrent: false
 find-process-mode: off
-external-controller: 127.0.0.1:9090
+# No external-controller. It stands up an HTTP server plus a websocket that
+# streams every connection event, and the traffic/connection tables it feeds are
+# retained for it — pure overhead for a config driven from a GUI, which injects
+# its own controller anyway. Add 'external-controller: 127.0.0.1:9090' back if
+# you drive this from the command line and want the API.
+#
+# geo-auto-update off, and no GEOIP/GEOSITE rule anywhere in this file: the geo
+# databases are tens of megabytes resident once loaded and are the largest single
+# thing a mihomo client can be made to hold. The rules below are plain CIDRs,
+# which cost nothing.
+geo-auto-update: false
+# Keepalives on an idle mobile link are radio wakeups, not reliability. mihomo's
+# default probes every 15 s; ten minutes idle before the first probe keeps NAT
+# bindings alive on every carrier documented here at a fraction of the wakeups.
+keep-alive-idle: 600
+keep-alive-interval: 60
+profile:
+  store-selected: true
+  # No fake-ip cache on disk: it is rebuilt in under a second and a stale one
+  # outlives the DNS answers it was derived from.
+  store-fake-ip: false
+# Sniffing re-reads the first bytes of every connection to recover a hostname.
+# Nothing here needs it — the rules match on IP and the DNS section already
+# resolves names — and it costs a buffer and a parse per connection.
+sniffer:
+  enable: false
+EOF
+    # --- TUN ---
+    # Off by default: TUN needs NET_ADMIN, and a GUI client toggles it itself.
+    # The block is written anyway so that when it IS switched on it comes up at
+    # an MTU this path can carry. mihomo's own default is 9000. On a network
+    # that suppresses the ICMP "fragmentation needed" reply — which is every
+    # carrier this deployment targets — an MTU above the real path limit is
+    # never corrected downward: handshakes and DNS fit and succeed, so the
+    # client reports connected, while every full-size TLS record and QUIC
+    # datagram is dropped in silence. That is the "connects but will not load
+    # pages" failure, and this one number is the whole of it.
+    cat <<EOF
+# TUN is off here because it needs NET_ADMIN and a GUI client switches it on
+# itself. The block exists so that when it IS switched on, it comes up at an MTU
+# this path can carry.
+#
+# mtu is the size of the packet an application hands to the tunnel, and it is the
+# setting most likely to be wrong while looking right. mihomo's own default is
+# 9000. ${CLIENT_MTU} is the IPv6 minimum, which every network is required to carry, so
+# one value covers Wi-Fi, mobile and CGNAT with no per-network retuning.
+#
+# Set it above what the path really carries and nothing reports an error: the
+# carriers this config targets suppress the ICMP "fragmentation needed" reply
+# that Path MTU Discovery needs, so the client never learns to send smaller.
+# Handshakes and DNS are small enough to fit, so the tunnel connects and looks
+# healthy, while full-size TLS records and QUIC datagrams are dropped in silence
+# — pages hang half-loaded and image-heavy apps crawl. Under-declaring costs
+# about 4% of throughput. Over-declaring costs the session.
+#
+# Measure your own path with:  mihomoctl pmtu <this client's address>
+tun:
+  enable: false
+  stack: gvisor
+  mtu: ${CLIENT_MTU}
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - 0.0.0.0:53
 EOF
     # DNS is the one part of a client config that can break EVERY node at once,
     # and it does so on exactly the networks this deployment exists for.
@@ -3947,71 +4772,27 @@ EOF
     if mihomo_of "$key" >>"$f" 2>/dev/null; then names+=("$(node_name "$key")"); fi
   done
   {
-    # Two automatic groups, because they fail over on different principles and
-    # this network kills flows on a timescale neither one alone covers.
+    # ONE group, and it does no health checking at all.
     #
-    #   AUTO     url-test — picks the lowest latency of everything alive. Best
-    #            steady-state choice, but it memoises its pick in a singleflight
-    #            with a 10-SECOND result TTL, so it can keep handing out a node
-    #            the health checker has already buried for up to 10 s.
-    #   FAILOVER fallback — takes the first node in list order that is alive and
-    #            moves on the moment it is not. No latency optimisation, no
-    #            10 s cache. This is the one to select when nodes are dying.
+    # A url-test / fallback group is the only thing in a client config that puts
+    # packets on the wire while you are sending none: one dial per node, per
+    # group, per interval, forever. With every node in the bundle that is a
+    # steady drip of connections to one IP across many ports — port-scan shaped,
+    # on a metered link, whether or not the tunnel is in use. This config has no
+    # such group, so an idle client is genuinely idle.
     #
-    # interval is SECONDS (default 300 — five minutes of a dead node selected,
-    # against measured flow kills at 7-35 s), tolerance is MILLISECONDS, and
-    # timeout is MILLISECONDS. Note that timeout does double duty: it is both
-    # the per-probe deadline AND the window in which max-failed-times failures
-    # have to occur, so shortening it also shortens that window — hence the
-    # matching drop in max-failed-times.
+    # The trade is explicit and worth stating: nothing fails over for you. If the
+    # node you picked stops passing traffic, you pick another one in the client.
+    # store-selected above remembers the choice across restarts.
     #
-    # lazy defaults to TRUE, which skips a tick whenever the group has not been
-    # dialled through within the last interval. Note what that does and does not
-    # mean: the group you have SELECTED is being dialled through, so it probes on
-    # every tick regardless. lazy only decides whether the group you are NOT
-    # using stays warm.
-    #
-    # So lazy:false is set on FAILOVER alone. That keeps the escape hatch warm
-    # for the moment a node dies, and costs one probe per node per interval —
-    # setting it on both groups would double the probe traffic to buy nothing,
-    # because the two groups have separate health checkers and do not share
-    # results. With the full catalogue that difference is ~80 extra dials a
-    # minute to one IP across ~80 ports, which is a port-scan-shaped pattern and
-    # the opposite of what the multiplexing above is for.
-    #
-    # The test URL is Cloudflare's rather than gstatic's: ten clients probing
-    # the same Google endpoint on the same schedule is both rate-limited and a
-    # pattern. expected-status pins it to 204 so a captive portal's 200 does not
-    # read as success.
-    local _url="http://cp.cloudflare.com/generate_204"
+    # DIRECT is last so it is reachable in the same list when you want to check
+    # whether a problem is the node or the network.
     echo "proxy-groups:"
     echo "  - name: PROXY"
     echo "    type: select"
     echo "    proxies:"
-    echo "      - AUTO"
-    echo "      - FAILOVER"
     for n in "${names[@]}"; do echo "      - \"$n\""; done
     echo "      - DIRECT"
-    echo "  - name: AUTO"
-    echo "    type: url-test"
-    echo "    url: ${_url}"
-    echo "    interval: ${PROBE_INTERVAL}"
-    echo "    timeout: ${PROBE_TIMEOUT}"
-    echo "    tolerance: 30"
-    echo "    max-failed-times: 2"
-    echo "    expected-status: '204'"
-    echo "    proxies:"
-    for n in "${names[@]}"; do echo "      - \"$n\""; done
-    echo "  - name: FAILOVER"
-    echo "    type: fallback"
-    echo "    url: ${_url}"
-    echo "    interval: ${PROBE_INTERVAL}"
-    echo "    timeout: ${PROBE_TIMEOUT}"
-    echo "    lazy: false"
-    echo "    max-failed-times: 2"
-    echo "    expected-status: '204'"
-    echo "    proxies:"
-    for n in "${names[@]}"; do echo "      - \"$n\""; done
     echo "rules:"
     echo "  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve"
     echo "  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve"
@@ -4116,6 +4897,28 @@ write_readme() {
     echo "  path                 ${PATH_RTT_MS} ms RTT, ~${PATH_LOSS_PCT}% loss assumed"
     echo "  KCP framing          mtu ${KCP_MTU}, tti ${MKCP_TTI} ms"
     echo "  windows              $(_pkts_down) packets in flight down, $(_pkts_up) up"
+    echo "  client TUN mtu       ${CLIENT_MTU}"
+    echo
+    echo "  CLIENT MTU is the one number here that fails silently. It is the size"
+    echo "  of the packet an application hands to the tunnel; ${CLIENT_MTU} is the IPv6"
+    echo "  minimum, which every network is required to carry, so it holds on"
+    echo "  Wi-Fi, mobile and CGNAT alike without per-network retuning."
+    echo "  Set it above what the path carries and nothing reports an error:"
+    echo "  Iranian carriers suppress the ICMP 'fragmentation needed' reply that"
+    echo "  Path MTU Discovery needs, so the client never learns to send smaller."
+    echo "  Handshakes and DNS are small enough to fit, so the tunnel connects and"
+    echo "  looks healthy; full-size TLS records and QUIC datagrams are dropped in"
+    echo "  silence, so pages hang half-loaded and image-heavy apps crawl."
+    echo "  Measure your own path with:  mihomoctl pmtu <a client's address>"
+    echo "  It is unrelated to the KCP mtu above, which sizes the OUTER datagram."
+    echo
+    echo "  NO HEALTH CHECKS. The client config has one group, PROXY, of type"
+    echo "  select. There is no url-test or fallback group, so the client puts"
+    echo "  nothing on the wire while you are not using it — no dial per node per"
+    echo "  interval, no steady drip of connections to one IP across many ports."
+    echo "  The trade is that nothing fails over for you: if the node you picked"
+    echo "  stops passing traffic, pick another one in the client. The choice is"
+    echo "  remembered across restarts (profile.store-selected)."
     echo
     echo "  mKCP and kcp-tun size their windows from the link of the side that"
     echo "  writes the number, so the two ends carry DIFFERENT values on purpose:"

@@ -620,6 +620,7 @@ sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols recommend
 | Preset | Meaning |
 |---|---|
 | `sampler` | **the default** — exactly one listener per base protocol (12) |
+| `iran` | Iran_FucedUPMODE — 11 pinned-port listeners tuned for Iranian mobile carriers |
 | `recommended` | a curated 14 covering every distinct technique |
 | `core` | the 8 classics the sing-box / Xray scripts also offer |
 | `all` | every valid combination (81) |
@@ -661,6 +662,101 @@ The preference list names *which member* of a family to use; it is not the sourc
 which families exist. Anything in the catalogue that the list does not cover is picked up
 automatically, so a protocol added upstream cannot go missing from the one preset that claims
 to cover everything.
+
+### `iran` — Iran_FucedUPMODE
+
+A pinned-port profile for MCI / MTN / Irancell, selectable as `--protocols iran`
+or from the preset list in the menu. Eleven listeners, and **it is not part of
+`all`**: each entry is one specific (protocol × camouflage × port × tuning)
+instance chosen for one path, and sweeping them into `all` would put two
+differently-tuned copies of the same combination on one host.
+
+Every listener answers one question rather than just existing:
+
+| Pair | Isolates |
+|---|---|
+| `443` vs `30443` | identical vless+JLS. Is the carrier filtering the **port**, or the protocol? |
+| `8801` vs `41821` | the same question for UDP, on identical kcptun listeners |
+| `3478` vs `19302` | identical mKCP except `congestion` |
+| `8801` vs `8802` | FEC 10/3 + interval 20 against 10/4 + interval 10 |
+| `443` `2053` `2083` `2087` `2096` | five protocol × camouflage pairs on ports that carry plausible HTTPS |
+
+```
+ir-jls-vless-443       tcp/443    vless  + JLS      -> cdn.jsdelivr.net
+ir-jls-vless-30443     tcp/30443  vless  + JLS      -> cdn.jsdelivr.net   (port control)
+ir-restls-vless-2053   tcp/2053   vless  + RestLS   -> cdn.jsdelivr.net
+ir-jls-trojan-2083     tcp/2083   trojan + JLS      -> cdnjs.cloudflare.com
+ir-restls-vmess-2087   tcp/2087   vmess  + RestLS   -> unpkg.com
+ir-restls-anytls-2096  tcp/2096   anytls + RestLS   -> www.bing.com
+ir-mkcp-vmess-3478     udp/3478   vmess  + mKCP srtp, congestion on
+ir-mkcp-vmess-19302    udp/19302  vmess  + mKCP srtp, congestion off
+ir-kcptun-ss-8801      udp/8801   ss2022 + kcptun manual, FEC 10/3, interval 20
+ir-kcptun-ss-8802      udp/8802   ss2022 + kcptun manual, FEC 10/4, interval 10
+ir-kcptun-ss-41821     udp/41821  ss2022 + kcptun manual, FEC 10/3   (port control)
+```
+
+**Ports are not interchangeable with the headers they carry.** 3478/udp is the
+IANA STUN port and mKCP wears `header: srtp` there, so the packets look like
+WebRTC media on the port WebRTC actually uses; srtp on a random high port is a
+contradiction a classifier can see. 19302 is Google's public STUN port, same
+reasoning. 8801/8802 sit in Zoom's media range. 8443 is deliberately unused —
+the local decoy nginx binds `127.0.0.1:8443` and a `::` listener would collide.
+
+**Each TCP listener relays failed probes to a different site.** Pointing all of
+them at one CDN repeats the mistake of pointing all of them at Apple: one
+reclassification and the whole family goes at once.
+
+**Every listener has its own secrets.** The rest of the catalogue shares a UUID
+across a family, which is fine when the nodes differ only by transport. Here two
+listeners are the same protocol on different ports specifically so they can be
+compared, so a leaked config for the `30443` control must not also hand over
+`443`, and the three kcptun nodes must not share the key identifying their
+stream. Each RestLS listener also gets its own record programme — sharing one
+would give all three the same record-length signature, which is the one thing
+RestLS exists to remove.
+
+#### `mode: manual` is load-bearing
+
+`transport/kcptun/common.go` defaults an **empty** mode to `"fast"` and then
+switches on it; `normal`/`fast`/`fast2`/`fast3` each overwrite
+`nodelay`/`interval`/`resend`/`nc` wholesale. There is no `default:` arm, so only
+a value outside that set leaves your timers alone. Setting the timers next to a
+preset mode is not an error — they are silently discarded, which is worse.
+
+| mode | nodelay, interval, resend, nc |
+|---|---|
+| `normal` | 0, 40, 2, 1 |
+| `fast` | 0, 30, 2, 1 |
+| `fast2` | 1, 20, 2, 1 |
+| `fast3` | 1, 10, 2, 1 |
+| `manual` | whatever you set |
+
+#### The two MTUs
+
+`mtu: 1232` on kcptun/mKCP is the **outer UDP datagram**: 1280 − 40 (IPv6
+header) − 8 (UDP header). The listener binds `::` so it must survive the IPv6
+case; on IPv4 the packet lands at 1260. `mtu: 1280` in the client `tun:` block is
+the **inner packet**. Lowering one does not lower the other, and both are correct
+at the same time.
+
+#### Before deploying
+
+```bash
+ss -ulnp | grep 3478       # coturn likes this port
+sysctl net.core.rmem_max   # must be >= 16777216 or sockbuf is clamped to ~200 KB
+```
+
+The script's own kernel tuning sets `rmem_max` to exactly 16777216, so that is
+satisfied unless you ran `--no-kernel-tuning`. Port 443 needs
+`CAP_NET_BIND_SERVICE`; the generated unit already grants it.
+
+Only mihomo-based clients can dial any of this — JLS, RestLS, mKCP and kcptun
+have no share-link grammar, so it is `client-mihomo.yaml` import, not a
+subscription URL.
+
+The profile is named `Iran_FucedUPMODE`; the CLI token is `iran` (aliases
+`iran-mobile`, `ir`) because the original name contains a `*`, which a shell
+expands before the script ever sees the word.
 
 ### The interactive menu
 

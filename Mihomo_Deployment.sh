@@ -314,15 +314,28 @@ CERT_PIN=""
 #      simple-obfs are Shadowsocks-only; obfs-opts is Snell-only.
 # =============================================================================
 declare -a ALL_KEYS=()
-declare -A K_BASE=() K_XPORT=() K_SEC=() K_PORTS=() K_VAR=()
+declare -A K_BASE=() K_XPORT=() K_SEC=() K_PORTS=() K_VAR=() K_DEST=()
+# Per-listener secrets, keyed "<catalogue key>:<field>". Empty for the ordinary
+# catalogue, which deliberately shares one UUID and one password across a
+# family; filled per key by the iran profile, where two listeners are the same
+# protocol on different ports and a leaked config for one must not hand over the
+# other. _ks() reads it with the shared value as the fallback.
+declare -A K_SECRET=()
 
 # _cat_add <key> <base> <transport> <security> <candidate ports...>
 _cat_add() {
   local key=$1 base=$2 xport=$3 sec=$4; shift 4
   ALL_KEYS+=("$key")
   K_BASE[$key]="$base"; K_XPORT[$key]="$xport"; K_SEC[$key]="$sec"
-  K_PORTS[$key]="$*"; K_VAR[$key]=""
+  K_PORTS[$key]="$*"; K_VAR[$key]=""; K_DEST[$key]=""
 }
+
+# _cat_dest <key> <host>
+# Overrides the camouflage destination for ONE listener. The ordinary catalogue
+# leaves this empty and every borrowed-identity layer relays to the single
+# --steal-sni. That is one blocklist entry away from taking out ShadowTLS,
+# RestLS and JLS together, which is exactly what a per-listener dest avoids.
+_cat_dest() { K_DEST[$1]="$2"; }
 
 # _cat_var <key> <variant>
 # A transport parameter whose right value is a judgement call rather than a fact
@@ -486,6 +499,167 @@ readonly RECOMMENDED_KEYS="vless-tcp-reality vless-ws-tls vless-grpc-reality vle
 # The "classic" set, i.e. what the sing-box / Xray scripts also offer.
 readonly CORE_KEYS="vless-tcp-reality vless-ws-tls vmess-ws-tls trojan-tcp-tls anytls-tls ss-plain hysteria2 tuic"
 
+# =============================================================================
+#  Iran_FucedUPMODE — the Iranian mobile-carrier profile
+#
+#  A separate, pinned-port catalogue. These are NOT part of the cross product
+#  above and are excluded from `--protocols all`: each one is a specific
+#  (protocol x camouflage x port x tuning) instance chosen for one path, and
+#  sweeping them into `all` would put two differently-tuned copies of the same
+#  combination on one host for no reason.
+#
+#  Eleven listeners, laid out so each answers ONE question rather than just
+#  existing:
+#
+#    443   vs 30443   identical vless+JLS. Is the carrier filtering the PORT,
+#                     or the protocol? Fixed-line answers this differently from
+#                     mobile, which is the whole reason the profile exists.
+#    8801  vs 41821   the same question for UDP, on identical kcptun listeners.
+#    3478  vs 19302   identical mKCP except `congestion`. A fixed-rate sender on
+#                     a shaped carrier is a theory; this measures it.
+#    8801  vs 8802    FEC 10/3 + interval 20 against 10/4 + interval 10.
+#    443 2053 2083 2087 2096
+#                     five protocol x camouflage pairs, all on ports that carry
+#                     plausible HTTPS (443 plus Cloudflare's published alt set).
+#
+#  Every TCP listener relays failed probes to a DIFFERENT site. Pointing all of
+#  them at one CDN repeats the mistake of pointing all of them at Apple: one
+#  reclassification and the entire family goes at once.
+#
+#  Port choices are not arbitrary and are not interchangeable with the header
+#  they carry:
+#    3478/udp  is the IANA STUN port, and mKCP wears `header: srtp` there — the
+#              packets look like WebRTC media on the port WebRTC actually uses.
+#              srtp on a random high port is a contradiction a classifier sees.
+#    19302/udp is Google's public STUN endpoint's port, same reasoning.
+#    8801/8802 are in Zoom's media range, where a sustained UDP flow is dull.
+#    8443      is deliberately NOT used: the local decoy nginx binds
+#              127.0.0.1:8443 and a "::" listener would collide with it.
+# =============================================================================
+declare -a IRAN_KEYS=()
+
+# Same signature as _cat_add, but registers into IRAN_KEYS instead of ALL_KEYS.
+_ir_add() {
+  local key=$1 base=$2 xport=$3 sec=$4 port=$5
+  IRAN_KEYS+=("$key")
+  K_BASE[$key]="$base"; K_XPORT[$key]="$xport"; K_SEC[$key]="$sec"
+  # One candidate only. These ports are the point of the profile — silently
+  # sliding to a second choice would destroy the comparison being set up.
+  K_PORTS[$key]="$port"; K_VAR[$key]=""; K_DEST[$key]=""
+}
+
+build_iran_catalogue() {
+  IRAN_KEYS=()
+  _ir_add ir-jls-vless-443      vless  tcp    jls    443
+  _cat_dest ir-jls-vless-443      cdn.jsdelivr.net
+  _ir_add ir-jls-vless-30443    vless  tcp    jls    30443
+  _cat_dest ir-jls-vless-30443    cdn.jsdelivr.net
+  _ir_add ir-restls-vless-2053  vless  tcp    restls 2053
+  _cat_dest ir-restls-vless-2053  cdn.jsdelivr.net
+  _ir_add ir-jls-trojan-2083    trojan tcp    jls    2083
+  _cat_dest ir-jls-trojan-2083    cdnjs.cloudflare.com
+  _ir_add ir-restls-vmess-2087  vmess  tcp    restls 2087
+  _cat_dest ir-restls-vmess-2087  unpkg.com
+  _ir_add ir-restls-anytls-2096 anytls tcp    restls 2096
+  _cat_dest ir-restls-anytls-2096 www.bing.com
+
+  _ir_add ir-mkcp-vmess-3478    vmess  mkcp   none   3478
+  K_VAR[ir-mkcp-vmess-3478]="srtp"
+  _ir_add ir-mkcp-vmess-19302   vmess  mkcp   none   19302
+  K_VAR[ir-mkcp-vmess-19302]="srtp-nocong"
+
+  _ir_add ir-kcptun-ss-8801     ss     kcptun none   8801
+  K_VAR[ir-kcptun-ss-8801]="manual"
+  _ir_add ir-kcptun-ss-8802     ss     kcptun none   8802
+  K_VAR[ir-kcptun-ss-8802]="manual-fec4"
+  _ir_add ir-kcptun-ss-41821    ss     kcptun none   41821
+  K_VAR[ir-kcptun-ss-41821]="manual"
+  return 0
+}
+build_iran_catalogue
+readonly IRAN_KEYS
+
+# True for a listener that belongs to the iran profile. Every tuned value below
+# is selected per key rather than by a global mode flag, so a selection that
+# mixes iran listeners with ordinary ones tunes each of them correctly instead
+# of applying one profile's numbers to both.
+_is_ir() { [[ $1 == ir-* ]]; }
+
+# Per-listener secret with the shared credential as the fallback.
+_ks() { printf '%s' "${K_SECRET[${1}:${2}]:-$3}"; }
+
+# --- the tuned values, all per key ------------------------------------------
+# 1232 = 1280 (the path MTU every Iranian mobile carrier has been measured to
+# carry) - 40 (IPv6 header) - 8 (UDP header). The listener binds "::" so it has
+# to survive the IPv6 case; on IPv4 the packet lands at 1260. This is the OUTER
+# datagram and is a different number from the client's TUN mtu of 1280 — one
+# does not follow the other.
+_kcp_mtu_of()  { _is_ir "$1" && printf '1232' || printf '%s' "$KCP_MTU"; }
+_mkcp_tti_of() { _is_ir "$1" && printf '20'   || printf '%s' "$MKCP_TTI"; }
+
+# Symmetric windows. The derived asymmetric split only works if the client
+# mirrors it inverted; where it does not, throughput collapses to the smaller of
+# the two and the failure looks like a slow path rather than a config error.
+# 1024 covers the measured BDP (120 ms x 25 Mbit/s = 310 packets at 1208 B of
+# payload, x1.3 for FEC = 403) with 2x burst headroom.
+_ir_wnd() { printf '1024'; }
+
+# Capacity is MB/s per connection, and mihomo derives the in-flight window from
+# it: capacity*1048576 / mtu / (1000/tti). At mtu 1232 and tti 20 that is 340
+# packets down and 85 up. The catalogue's derived 52/13 would give ~1100 packets
+# — about 1.3 MB of unacked data on a shaped mobile link, which is bufferbloat,
+# and it makes the documented 7-35 s flow kills worse rather than better.
+_ir_cap_down() { printf '20'; }
+_ir_cap_up()   { printf '5'; }
+
+# RestLS pads every short record up to this floor. Iranian DPI has been reported
+# to classify on record-length distribution, and 0 (the default) leaks that
+# distribution intact.
+_restls_minlen_of() {
+  _is_ir "$1" && printf '96' || printf '%s' "$RESTLS_MIN_RECORD_LEN"
+}
+
+# rate-limit throttles ONLY the relay served to a failed-auth prober, so it
+# costs real users nothing and stops a scanner measuring your uplink through the
+# fallback. It is off outside this profile because a capped, unnaturally smooth
+# decoy bitrate is itself measurable — here the trade is taken deliberately.
+_probe_ratelimit_of() { _is_ir "$1" && printf '262144' || printf '0'; }
+
+# Where a failed prober gets relayed, and what SNI the client claims. A per-key
+# dest wins; everything else falls back to the one global decoy.
+_dest_of() {
+  [[ -n ${K_DEST[$1]:-} ]] && { printf '%s:443' "${K_DEST[$1]}"; return 0; }
+  _decoy_dest
+}
+_sni_of() {
+  [[ -n ${K_DEST[$1]:-} ]] && { printf '%s' "${K_DEST[$1]}"; return 0; }
+  _decoy_sni
+}
+
+# The four KCP timers, emitted only where `mode: manual` makes them live.
+#
+# This is the trap the whole manual mode exists to avoid: transport/kcptun's
+# FillDefaults turns an EMPTY mode into "fast" and then switches on it, and
+# normal/fast/fast2/fast3 each overwrite nodelay/interval/resend/nc wholesale.
+# There is no default: arm, so any value outside that set — "manual" — is what
+# leaves your numbers alone. Setting the timers next to a preset mode is not an
+# error; it is silently discarded, which is worse.
+_kcptun_timers_of() {
+  _is_ir "$1" || return 0
+  local iv=20
+  # The 10/4 listener also halves the flush interval: it is the "path is bad"
+  # variant, and both knobs move together so the comparison stays one variable.
+  [[ ${K_VAR[$1]:-} == manual-fec4 ]] && iv=10
+  printf '      nodelay: 1\n      interval: %s\n      resend: 2\n' "$iv"
+  # nc:1 DISABLES congestion control — KCP's naming is inverted. Paired with the
+  # ratelimit above, which is what actually bounds the sender here.
+  printf '      nc: 1\n'
+  # ACK at once instead of batching. Materially better under reordering, which
+  # is what multi-second inter-segment gaps with constant SACK actually are.
+  printf '      acknodelay: true\n'
+  return 0
+}
+
 # --- 'sampler': exactly ONE listener per base protocol ------------------------
 # The tuning set, and the default. 'recommended' and 'core' both weight towards
 # VLESS because that is what is popular; neither answers the question you
@@ -574,6 +748,8 @@ proto_desc() {
         static) xd="KCPTun, no rotation" ;;
         fec)    xd="KCPTun, FEC 10/3" ;;
         fast3)  xd="KCPTun, mode fast3" ;;
+        manual)      xd="KCPTun manual 10/3 i20" ;;
+        manual-fec4) xd="KCPTun manual 10/4 i10" ;;
         *)      xd="KCPTun (UDP)" ;;
       esac ;;
     quic)      xd="QUIC" ;;
@@ -891,6 +1067,9 @@ save_state() {
     done
     local k
     for k in "${!PORT[@]}"; do printf "PORT['%s']='%s'\n" "$k" "${PORT[$k]}"; done
+    for k in "${!K_SECRET[@]}"; do
+      printf "K_SECRET['%s']='%s'\n" "$k" "${K_SECRET[$k]//\'/\'\\\'\'}"
+    done
   } >"$STATE_FILE"
   chmod 0600 "$STATE_FILE"
 }
@@ -984,7 +1163,16 @@ Common options:
                                GOAMD64 build to fetch. 'auto' probes /proc/cpuinfo;
                                the plain 'amd64' asset upstream is a v3 build and
                                SIGILLs on pre-Haswell CPUs, hence this flag.
-      --protocols <sampler|recommended|core|all|list>
+      --protocols <sampler|iran|recommended|core|all|list>
+                               'iran' = Iran_FucedUPMODE: 11 listeners on pinned
+                               ports (443 / 2053 / 2083 / 2087 / 2096 for TCP,
+                               3478 / 8801 / 8802 / 19302 / 41821 for UDP), each
+                               with its own secrets and its own decoy site, tuned
+                               for MCI / MTN / Irancell: kcp mtu 1232, symmetric
+                               1024 windows, kcptun mode manual so the timers
+                               actually apply, and paired controls so you can
+                               tell a blocked PORT from a blocked protocol.
+                               Not included in 'all'.
                                'sampler' (the default) = exactly one listener per
                                base protocol, so a first deploy is something you
                                can measure rather than 81 sockets. Find the family
@@ -1071,6 +1259,11 @@ list_protocols() {
     i=$((i+1))
   done
   printf '\n%d combinations total.\n' "${#ALL_KEYS[@]}"
+  printf '\n     %s%s%s\n' "$C_BOLD" "Iran_FucedUPMODE  (--protocols iran)  — pinned ports, not part of 'all'" "$C_RST"
+  for k in "${IRAN_KEYS[@]}"; do
+    printf '     %-24s %-5s %-6s %s\n' "$k" "$(proto_l4 "$k")" "${K_PORTS[$k]}" "$(proto_desc "$k")"
+  done
+  printf '\n%d iran listeners.\n' "${#IRAN_KEYS[@]}"
 }
 
 # -----------------------------------------------------------------------------
@@ -1137,6 +1330,11 @@ _expand_token() {
     all|"*")        printf '%s\n' "${ALL_KEYS[@]}"; return 0 ;;
     sampler|one-of-each|oneofeach|each)
                     printf '%s\n' $SAMPLER_KEYS; return 0 ;;
+    # The literal profile name is accepted too, but a shell will try to glob the
+    # '*' in it before the script ever sees the word, so the short token is the
+    # one to type.
+    iran|iran-mobile|ir|"Iran_FucedUPMODE"|"Iran_Fuc*edUPMODE")
+                    printf '%s\n' "${IRAN_KEYS[@]}"; return 0 ;;
     recommended|rec) printf '%s\n' $RECOMMENDED_KEYS; return 0 ;;
     core|classic)   printf '%s\n' $CORE_KEYS; return 0 ;;
     # families by base protocol
@@ -1426,9 +1624,10 @@ _tui_row() {   # _tui_row <is-cursor> <text>
 
 # --- screen 1: which preset --------------------------------------------------
 _tui_presets() {
-  local -a tok=(sampler recommended core all custom)
+  local -a tok=(sampler iran recommended core all custom)
   local -a lbl=(
     "sampler       one listener per protocol family"
+    "iran          Iran_FucedUPMODE — pinned ports, mobile-carrier tuning"
     "recommended   a curated spread of every distinct technique"
     "core          the classics the sing-box / Xray scripts also offer"
     "all           every valid combination in the catalogue"
@@ -1436,6 +1635,7 @@ _tui_presets() {
   )
   local -a cnt=(
     "$(printf '%s' "$SAMPLER_KEYS" | wc -w)"
+    "${#IRAN_KEYS[@]}"
     "$(printf '%s' "$RECOMMENDED_KEYS" | wc -w)"
     "$(printf '%s' "$CORE_KEYS" | wc -w)"
     "${#ALL_KEYS[@]}"
@@ -1578,9 +1778,10 @@ _tui_checklist() {   # _tui_checklist <space separated keys to pre-tick>
 _tui_collapse() {
   local want; want="$(printf '%s\n' ${PROTO_CHOICE//,/ } | sort | tr '\n' ' ')"
   local name have
-  for name in sampler recommended core all; do
+  for name in sampler iran recommended core all; do
     case "$name" in
       sampler)     have="$SAMPLER_KEYS" ;;
+      iran)        have="${IRAN_KEYS[*]}" ;;
       recommended) have="$RECOMMENDED_KEYS" ;;
       core)        have="$CORE_KEYS" ;;
       all)         have="${ALL_KEYS[*]}" ;;
@@ -1637,6 +1838,9 @@ _pick_protocols_typed() {
   echo "  base protocol x transport x security layer."
   echo
   echo "    ${C_BOLD}sampler${C_RST}      one listener per protocol family ($(printf '%s' "$SAMPLER_KEYS" | wc -w) listeners) — the default"
+  echo "    ${C_BOLD}iran${C_RST}         Iran_FucedUPMODE — ${#IRAN_KEYS[@]} listeners on pinned ports (443, 2053,"
+  echo "                 2083, 2087, 2096, 3478, 8801, 8802, 19302, 30443, 41821)"
+  echo "                 with mobile-carrier tuning and per-listener secrets"
   echo "    ${C_BOLD}recommended${C_RST}  a curated $(printf '%s' "$RECOMMENDED_KEYS" | wc -w) that cover every distinct technique"
   echo "    ${C_BOLD}core${C_RST}         the $(printf '%s' "$CORE_KEYS" | wc -w) classics also offered by the sing-box / Xray scripts"
   echo "    ${C_BOLD}all${C_RST}          every combination (${#ALL_KEYS[@]} listeners, ${#ALL_KEYS[@]} ports)"
@@ -2432,6 +2636,43 @@ gen_credentials() {
   if _base_used sudoku; then
     [[ -n $SUDOKU_PUB && -n $SUDOKU_PRIV ]] || gen_sudoku_keys
   fi
+
+  # --- per-listener secrets for the iran profile ---
+  # The rest of the catalogue deliberately shares one UUID across a family: the
+  # nodes differ by transport, and a client that has one has a right to the
+  # others. This profile is different. Two of its listeners are the same
+  # protocol on different ports specifically so they can be compared, so a
+  # leaked config for the 30443 control must not also hand over 443 — and the
+  # three kcptun listeners must not share the key that identifies their stream.
+  #
+  # Only ever fills a blank, so a re-run keeps every secret already published.
+  local k _b
+  for k in $SELECTED; do
+    _is_ir "$k" || continue
+    case "${K_BASE[$k]}" in
+      vless|vmess) [[ -n ${K_SECRET[${k}:uuid]:-} ]] || K_SECRET[${k}:uuid]="$(gen_uuid)" ;;
+      trojan|anytls) [[ -n ${K_SECRET[${k}:pw]:-} ]] || K_SECRET[${k}:pw]="$(gen_pass)" ;;
+      ss)
+        _b=16; [[ $SS_METHOD == *chacha20* || $SS_METHOD == *aes-256* ]] && _b=32
+        [[ -n ${K_SECRET[${k}:sspw]:-} ]] || K_SECRET[${k}:sspw]="$(gen_b64key "$_b")" ;;
+    esac
+    case "${K_SEC[$k]}" in
+      jls)
+        [[ -n ${K_SECRET[${k}:jlsuser]:-} ]] || K_SECRET[${k}:jlsuser]="u$(gen_hex 3)"
+        [[ -n ${K_SECRET[${k}:jlspw]:-} ]]   || K_SECRET[${k}:jlspw]="$(gen_pass)" ;;
+      restls)
+        [[ -n ${K_SECRET[${k}:restlspw]:-} ]] || K_SECRET[${k}:restlspw]="$(gen_pass)"
+        # A distinct record programme per listener. Sharing one across the three
+        # RestLS nodes would give all three the same record-length signature,
+        # which is the single thing RestLS exists to remove.
+        [[ -n ${K_SECRET[${k}:restlsscript]:-} ]] || K_SECRET[${k}:restlsscript]="$(gen_restls_script s)" ;;
+    esac
+    case "${K_XPORT[$k]}" in
+      mkcp)   [[ -n ${K_SECRET[${k}:seed]:-} ]]   || K_SECRET[${k}:seed]="$(gen_hex 8)" ;;
+      kcptun) [[ -n ${K_SECRET[${k}:kcpkey]:-} ]] || K_SECRET[${k}:kcpkey]="$(gen_pass)" ;;
+    esac
+  done
+
   ok "Secrets ready."
   return 0
 }
@@ -2940,7 +3181,11 @@ _mkcp_cong_of() {
 # fast2 (nodelay 1, 20 ms) and fast3 (nodelay 1, 10 ms) are what actually cut
 # retransmit latency, at the cost of a higher packet rate.
 _kcptun_mode_of() {
-  case "${K_VAR[$1]:-}" in fast3) printf 'fast3' ;; *) printf 'fast2' ;; esac
+  case "${K_VAR[$1]:-}" in
+    manual|manual-fec4) printf 'manual' ;;
+    fast3)              printf 'fast3'  ;;
+    *)                  printf 'fast2'  ;;
+  esac
 }
 
 # FEC CANNOT BE TURNED OFF in mihomo: FillDefaults rewrites datashard 0 -> 10 and
@@ -2977,6 +3222,13 @@ _tier_for_loss() {
 # always a meaningful A/B rather than two arbitrary constants. At the top tier
 # there is nothing stronger worth offering, so the two converge.
 _kcptun_fec_of() {
+  # The iran listeners pin FEC rather than deriving it from --loss-pct: 10/3 and
+  # 10/4 are the two ends of the comparison being run, so a change to the loss
+  # estimate must not quietly move both of them.
+  case "${K_VAR[$1]:-}" in
+    manual)      printf '10 3'; return 0 ;;
+    manual-fec4) printf '10 4'; return 0 ;;
+  esac
   local t
   t="$(_tier_for_loss "$PATH_LOSS_PCT")"
   [[ ${K_VAR[$1]:-} == fec ]] && t=$(( t + 1 ))
@@ -3075,13 +3327,17 @@ EOF
       cat <<EOF
     res-tls:
       enable: true
-      dest: $(_decoy_dest)
-      password: ${RESTLS_PASSWORD}
-      restls-script: "${RESTLS_SCRIPT_S}"
+      dest: $(_dest_of "$key")
+      password: $(_ks "$key" restlspw "$RESTLS_PASSWORD")
+      restls-script: "$(_ks "$key" restlsscript "$RESTLS_SCRIPT_S")"
 EOF
       # 0 means "omit and let the server use its built-in 15": a raised floor
       # pads every short record to a uniform size, which is its own signature.
-      (( RESTLS_MIN_RECORD_LEN > 0 )) && printf '      min-record-len: %s\n' "$RESTLS_MIN_RECORD_LEN"
+      local _mrl _rl
+      _mrl="$(_restls_minlen_of "$key")"
+      (( _mrl > 0 )) && printf '      min-record-len: %s\n' "$_mrl"
+      _rl="$(_probe_ratelimit_of "$key")"
+      (( _rl > 0 )) && printf '      rate-limit: %s\n' "$_rl"
       ;;
     jls)
       # alpn has to intersect what the client's browser fingerprint offers.
@@ -3095,15 +3351,18 @@ EOF
       cat <<EOF
     jls-config:
       enable: true
-      dest: $(_decoy_dest)
-      sni: $(_decoy_sni)
+      dest: $(_dest_of "$key")
+      sni: $(_sni_of "$key")
       users:
-        - username: ${JLS_USER}
-          password: ${JLS_PASSWORD}
+        - username: $(_ks "$key" jlsuser "$JLS_USER")
+          password: $(_ks "$key" jlspw "$JLS_PASSWORD")
       alpn:
 EOF
-      local _a; local IFS=','
-      for _a in $DECOY_ALPN; do printf '        - %s\n' "$_a"; done
+      local _a _jrl
+      { local IFS=','
+        for _a in $DECOY_ALPN; do printf '        - %s\n' "$_a"; done; }
+      _jrl="$(_probe_ratelimit_of "$key")"
+      (( _jrl > 0 )) && printf '      rate-limit: %s\n' "$_jrl"
       ;;
     # Retained for hand-editing /etc/mihomo/config.yaml; no catalogue key
     # selects it (see build_catalogue for why).
@@ -3150,15 +3409,15 @@ EOF
       cat <<EOF
     mkcp-config:
       enable: true
-      seed: ${MKCP_SEED}
+      seed: $(_ks "$key" seed "$MKCP_SEED")
       header: $(_mkcp_header_of "$key")
-      mtu: ${KCP_MTU}
-      tti: ${MKCP_TTI}
-      uplink-capacity: $(_mkcp_cap "$dp")
-      downlink-capacity: $(_mkcp_cap "$up")
+      mtu: $(_kcp_mtu_of "$key")
+      tti: $(_mkcp_tti_of "$key")
+      uplink-capacity: $(_is_ir "$key" && _ir_cap_down || _mkcp_cap "$dp")
+      downlink-capacity: $(_is_ir "$key" && _ir_cap_up || _mkcp_cap "$up")
       congestion: $(_mkcp_cong_of "$key")
-      write-buffer: $(_kcp_buf "$dp")
-      read-buffer: $(_kcp_buf "$up")
+      write-buffer: $(_is_ir "$key" && printf 4194304 || _kcp_buf "$dp")
+      read-buffer: $(_is_ir "$key" && printf 2097152 || _kcp_buf "$up")
 EOF
       ;;
     mekya)
@@ -3221,23 +3480,24 @@ EOF
       cat <<EOF
     kcp-tun:
       enable: true
-      key: ${KCPTUN_KEY}
+      key: $(_ks "$key" kcpkey "$KCPTUN_KEY")
       crypt: aes-128
       mode: $(_kcptun_mode_of "$key")
-      mtu: ${KCP_MTU}
-      sndwnd: $(_kcp_wnd "$dp")
-      rcvwnd: $(_kcp_wnd "$up")
+      mtu: $(_kcp_mtu_of "$key")
+      sndwnd: $(_is_ir "$key" && _ir_wnd || _kcp_wnd "$dp")
+      rcvwnd: $(_is_ir "$key" && _ir_wnd || _kcp_wnd "$up")
       datashard: $(_kcptun_ds_of "$key")
       parityshard: $(_kcptun_ps_of "$key")
       nocomp: true
-      ratelimit: $(( $(_rate_down) / $(_kcptun_conn_of "$key") ))
+      ratelimit: $(_is_ir "$key" && printf 5000000 || printf '%s' "$(( $(_rate_down) / $(_kcptun_conn_of "$key") ))")
       sockbuf: 16777216
       smuxver: 2
       smuxbuf: 8388608
       streambuf: 2097152
-      keepalive: 10
+      keepalive: $(_is_ir "$key" && printf 5 || printf 10)
       dscp: 0
 EOF
+      _kcptun_timers_of "$key"
       ;;
     *) : ;;
   esac
@@ -3305,23 +3565,23 @@ lst_of() {
 
   case "${K_BASE[$key]}" in
     vless)
-      printf '    users:\n      - username: %s\n        uuid: %s\n' "$NODE_LABEL" "$UUID"
+      printf '    users:\n      - username: %s\n        uuid: %s\n' "$NODE_LABEL" "$(_ks "$key" uuid "$UUID")"
       # XTLS Vision needs a real TLS record layer under it and raw TCP above it.
       if [[ ${K_XPORT[$key]} == tcp && ( ${K_SEC[$key]} == tls || ${K_SEC[$key]} == reality ) ]]; then
         printf '        flow: xtls-rprx-vision\n'
       fi
       _xport_block "$key"; _sec_block "$key"; _mux_listener_block "$key" ;;
     vmess)
-      printf '    users:\n      - username: %s\n        uuid: %s\n        alterId: 0\n' "$NODE_LABEL" "$UUID"
+      printf '    users:\n      - username: %s\n        uuid: %s\n        alterId: 0\n' "$NODE_LABEL" "$(_ks "$key" uuid "$UUID")"
       _xport_block "$key"; _sec_block "$key"; _mux_listener_block "$key" ;;
     trojan)
-      printf '    users:\n      - username: %s\n        password: %s\n' "$NODE_LABEL" "$PASSWORD"
+      printf '    users:\n      - username: %s\n        password: %s\n' "$NODE_LABEL" "$(_ks "$key" pw "$PASSWORD")"
       _xport_block "$key"; _sec_block "$key"; _mux_listener_block "$key" ;;
     anytls)
-      printf '    users:\n      %s: %s\n    padding-scheme: ""\n' "$NODE_LABEL" "$PASSWORD"
+      printf '    users:\n      %s: %s\n    padding-scheme: ""\n' "$NODE_LABEL" "$(_ks "$key" pw "$PASSWORD")"
       _sec_block "$key" ;;
     ss)
-      printf '    password: %s\n    cipher: %s\n    udp: true\n' "$SS_PASSWORD" "$SS_METHOD"
+      printf '    password: %s\n    cipher: %s\n    udp: true\n' "$(_ks "$key" sspw "$SS_PASSWORD")" "$SS_METHOD"
       _xport_block "$key"; _sec_block "$key"; _mux_listener_block "$key" ;;
     snell)
       printf '    psk: %s\n    version: %s\n    udp: true\n' "$SNELL_PSK" "$SNELL_VERSION"
@@ -4100,7 +4360,7 @@ _cli_alpn() {
 _cli_sni() {
   case "${K_SEC[$1]}" in
     reality)                        printf '%s' "$REALITY_SNI" ;;
-    shadowtls|restls|jls|tlsmirror) _decoy_sni ;;
+    shadowtls|restls|jls|tlsmirror) _sni_of "$1" ;;
     *)                              printf '%s' "$VPN_DOMAIN" ;;
   esac
 }
@@ -4161,9 +4421,9 @@ EOF
       _cli_alpn "$key"
       cat <<EOF
     restls-opts:
-      password: "${RESTLS_PASSWORD}"
+      password: "$(_ks "$key" restlspw "$RESTLS_PASSWORD")"
       version-hint: ${RESTLS_VERSION_HINT}
-      restls-script: "${RESTLS_SCRIPT_C}"
+      restls-script: "$(_ks "$key" restlsscript "$RESTLS_SCRIPT_C")"
 EOF
       ;;
     jls)
@@ -4171,8 +4431,8 @@ EOF
     tls: true
     servername: ${sni}
     jls-opts:
-      username: ${JLS_USER}
-      password: "${JLS_PASSWORD}"
+      username: $(_ks "$key" jlsuser "$JLS_USER")
+      password: "$(_ks "$key" jlspw "$JLS_PASSWORD")"
 EOF
       ;;
     tlsmirror)
@@ -4232,15 +4492,15 @@ EOF
       cat <<EOF
     network: mkcp
     mkcp-opts:
-      seed: ${MKCP_SEED}
+      seed: $(_ks "$key" seed "$MKCP_SEED")
       header: $(_mkcp_header_of "$key")
-      mtu: ${KCP_MTU}
-      tti: ${MKCP_TTI}
-      uplink-capacity: $(_mkcp_cap "$up")
-      downlink-capacity: $(_mkcp_cap "$dp")
+      mtu: $(_kcp_mtu_of "$key")
+      tti: $(_mkcp_tti_of "$key")
+      uplink-capacity: $(_is_ir "$key" && _ir_cap_up || _mkcp_cap "$up")
+      downlink-capacity: $(_is_ir "$key" && _ir_cap_down || _mkcp_cap "$dp")
       congestion: $(_mkcp_cong_of "$key")
-      write-buffer: $(_kcp_buf "$up")
-      read-buffer: $(_kcp_buf "$dp")
+      write-buffer: $(_is_ir "$key" && printf 2097152 || _kcp_buf "$up")
+      read-buffer: $(_is_ir "$key" && printf 4194304 || _kcp_buf "$dp")
 EOF
       ;;
     mekya)
@@ -4280,42 +4540,46 @@ mihomo_of() {
 
   case "${K_BASE[$key]}" in
     vless)
-      printf '    uuid: %s\n    udp: true\n    packet-encoding: xudp\n    client-fingerprint: chrome\n' "$UUID"
+      printf '    uuid: %s\n    udp: true\n    packet-encoding: xudp\n    client-fingerprint: chrome\n' "$(_ks "$key" uuid "$UUID")"
       if [[ ${K_XPORT[$key]} == tcp && ( ${K_SEC[$key]} == tls || ${K_SEC[$key]} == reality ) ]]; then
         printf '    flow: xtls-rprx-vision\n'
       fi
       _cli_xport "$key"; _cli_sec "$key" ;;
     vmess)
-      printf '    uuid: %s\n    alterId: 0\n    cipher: auto\n    udp: true\n    packet-encoding: xudp\n    client-fingerprint: chrome\n' "$UUID"
+      printf '    uuid: %s\n    alterId: 0\n    cipher: auto\n    udp: true\n    packet-encoding: xudp\n    client-fingerprint: chrome\n' "$(_ks "$key" uuid "$UUID")"
       _cli_xport "$key"; _cli_sec "$key" ;;
     trojan)
       # The trojan outbound has no `tls:` key — it is always TLS — and names its
       # SNI `sni:` rather than `servername:`.
       printf '    password: "%s"\n    udp: true\n    client-fingerprint: chrome\n    sni: %s\n    skip-cert-verify: %s\n' \
-        "$PASSWORD" "$(_cli_sni "$key")" "$sci"
+        "$(_ks "$key" pw "$PASSWORD")" "$(_cli_sni "$key")" "$sci"
       _cli_xport "$key"
       _cli_alpn "$key"
       case "${K_SEC[$key]}" in
         reality)   printf '    reality-opts:\n      public-key: %s\n      short-id: %s\n' "$REALITY_PUBLIC" "$REALITY_SHORTID" ;;
         shadowtls) printf '    shadow-tls-opts:\n      version: 3\n      password: "%s"\n' "$SHADOWTLS_PASSWORD" ;;
         restls)    printf '    restls-opts:\n      password: "%s"\n      version-hint: %s\n      restls-script: "%s"\n' \
-                     "$RESTLS_PASSWORD" "$RESTLS_VERSION_HINT" "$RESTLS_SCRIPT_C" ;;
-        jls)       printf '    jls-opts:\n      username: %s\n      password: "%s"\n' "$JLS_USER" "$JLS_PASSWORD" ;;
+                     "$(_ks "$key" restlspw "$RESTLS_PASSWORD")" "$RESTLS_VERSION_HINT" \
+                     "$(_ks "$key" restlsscript "$RESTLS_SCRIPT_C")" ;;
+        jls)       printf '    jls-opts:\n      username: %s\n      password: "%s"\n' \
+                     "$(_ks "$key" jlsuser "$JLS_USER")" "$(_ks "$key" jlspw "$JLS_PASSWORD")" ;;
         tls)       [[ $CERT_MODE == self && -n $CERT_PIN ]] && printf '    fingerprint: %s\n' "$CERT_PIN" ;;
       esac ;;
     anytls)
       printf '    password: "%s"\n    udp: true\n    client-fingerprint: chrome\n    sni: %s\n    skip-cert-verify: %s\n' \
-        "$PASSWORD" "$(_cli_sni "$key")" "$sci"
+        "$(_ks "$key" pw "$PASSWORD")" "$(_cli_sni "$key")" "$sci"
       _cli_alpn "$key"
       case "${K_SEC[$key]}" in
         shadowtls) printf '    shadow-tls-opts:\n      version: 3\n      password: "%s"\n' "$SHADOWTLS_PASSWORD" ;;
         restls)    printf '    restls-opts:\n      password: "%s"\n      version-hint: %s\n      restls-script: "%s"\n' \
-                     "$RESTLS_PASSWORD" "$RESTLS_VERSION_HINT" "$RESTLS_SCRIPT_C" ;;
-        jls)       printf '    jls-opts:\n      username: %s\n      password: "%s"\n' "$JLS_USER" "$JLS_PASSWORD" ;;
+                     "$(_ks "$key" restlspw "$RESTLS_PASSWORD")" "$RESTLS_VERSION_HINT" \
+                     "$(_ks "$key" restlsscript "$RESTLS_SCRIPT_C")" ;;
+        jls)       printf '    jls-opts:\n      username: %s\n      password: "%s"\n' \
+                     "$(_ks "$key" jlsuser "$JLS_USER")" "$(_ks "$key" jlspw "$JLS_PASSWORD")" ;;
         tls)       [[ $CERT_MODE == self && -n $CERT_PIN ]] && printf '    fingerprint: %s\n' "$CERT_PIN" ;;
       esac ;;
     ss)
-      printf '    cipher: %s\n    password: "%s"\n    udp: true\n    client-fingerprint: chrome\n' "$SS_METHOD" "$SS_PASSWORD"
+      printf '    cipher: %s\n    password: "%s"\n    udp: true\n    client-fingerprint: chrome\n' "$SS_METHOD" "$(_ks "$key" sspw "$SS_PASSWORD")"
       # Shadowsocks carries its extra layers as a SIP003-style plugin rather
       # than as top-level option blocks.
       case "${K_XPORT[$key]}:${K_SEC[$key]}" in
@@ -4332,15 +4596,21 @@ mihomo_of() {
           _up="$(_kcp_wnd "$(_per_conn "$(_pkts_up)" "$_n")")"
           printf '    plugin: kcptun\n    plugin-opts:\n'
           printf '      key: "%s"\n      crypt: aes-128\n      mode: %s\n      mtu: %s\n' \
-            "$KCPTUN_KEY" "$(_kcptun_mode_of "$key")" "$KCP_MTU"
-          printf '      sndwnd: %s\n      rcvwnd: %s\n' "$_up" "$_dp"
+            "$(_ks "$key" kcpkey "$KCPTUN_KEY")" "$(_kcptun_mode_of "$key")" "$(_kcp_mtu_of "$key")"
+          if _is_ir "$key"; then
+            printf '      sndwnd: %s\n      rcvwnd: %s\n' "$(_ir_wnd)" "$(_ir_wnd)"
+          else
+            printf '      sndwnd: %s\n      rcvwnd: %s\n' "$_up" "$_dp"
+          fi
           printf '      datashard: %s\n      parityshard: %s\n      nocomp: true\n' \
             "$(_kcptun_ds_of "$key")" "$(_kcptun_ps_of "$key")"
-          printf '      ratelimit: %s\n' "$(( $(_rate_up) / _n ))"
+          if _is_ir "$key"; then printf '      ratelimit: 5000000\n'
+          else printf '      ratelimit: %s\n' "$(( $(_rate_up) / _n ))"; fi
           printf '      sockbuf: 8388608\n      smuxver: 2\n      smuxbuf: 8388608\n      streambuf: 2097152\n'
           # keepalive under the 60 s idle window Iran's protocol whitelister
           # keeps per flow — a flow that goes quiet for longer is re-evaluated.
-          printf '      keepalive: 10\n      dscp: 0\n'
+          printf '      keepalive: %s\n      dscp: 0\n' "$(_is_ir "$key" && printf 5 || printf 10)"
+          _kcptun_timers_of "$key"
           if _kcptun_rotates "$key"; then
             printf '      conn: %s\n      autoexpire: 25\n      scavengettl: 20\n' "$_n"
           fi ;;
@@ -4349,12 +4619,14 @@ mihomo_of() {
             "$(_decoy_sni)" "$SHADOWTLS_PASSWORD" "$(_alpn_yaml_inline)" ;;
         *:restls)
           printf '    plugin: restls\n    plugin-opts:\n      host: %s\n      password: "%s"\n      version-hint: %s\n      restls-script: "%s"\n' \
-            "$(_decoy_sni)" "$RESTLS_PASSWORD" "$RESTLS_VERSION_HINT" "$RESTLS_SCRIPT_C" ;;
+            "$(_sni_of "$key")" "$(_ks "$key" restlspw "$RESTLS_PASSWORD")" "$RESTLS_VERSION_HINT" \
+            "$(_ks "$key" restlsscript "$RESTLS_SCRIPT_C")" ;;
         *:jls)
           # Unlike jls-opts on vless/vmess/trojan, the shadowsocks jls plugin
           # DOES take alpn, and it is the only ALPN this outbound has.
           printf '    plugin: jls\n    plugin-opts:\n      host: %s\n      username: %s\n      password: "%s"\n      alpn: [%s]\n' \
-            "$(_decoy_sni)" "$JLS_USER" "$JLS_PASSWORD" "$(_alpn_yaml_inline)" ;;
+            "$(_sni_of "$key")" "$(_ks "$key" jlsuser "$JLS_USER")" \
+            "$(_ks "$key" jlspw "$JLS_PASSWORD")" "$(_alpn_yaml_inline)" ;;
       esac ;;
     snell)
       printf '    psk: "%s"\n    version: %s\n    udp: true\n    client-fingerprint: chrome\n' "$SNELL_PSK" "$SNELL_VERSION"
@@ -4367,10 +4639,12 @@ mihomo_of() {
             "$(_decoy_sni)" "$SHADOWTLS_PASSWORD" "$(_alpn_yaml_inline)" ;;
         *:restls)
           printf '    obfs-opts:\n      mode: restls\n      host: %s\n      password: "%s"\n      version-hint: %s\n      restls-script: "%s"\n' \
-            "$(_decoy_sni)" "$RESTLS_PASSWORD" "$RESTLS_VERSION_HINT" "$RESTLS_SCRIPT_C" ;;
+            "$(_sni_of "$key")" "$(_ks "$key" restlspw "$RESTLS_PASSWORD")" "$RESTLS_VERSION_HINT" \
+            "$(_ks "$key" restlsscript "$RESTLS_SCRIPT_C")" ;;
         *:jls)
           printf '    obfs-opts:\n      mode: jls\n      host: %s\n      username: %s\n      password: "%s"\n      alpn: [%s]\n' \
-            "$(_decoy_sni)" "$JLS_USER" "$JLS_PASSWORD" "$(_alpn_yaml_inline)" ;;
+            "$(_sni_of "$key")" "$(_ks "$key" jlsuser "$JLS_USER")" \
+            "$(_ks "$key" jlspw "$JLS_PASSWORD")" "$(_alpn_yaml_inline)" ;;
       esac ;;
     hysteria2)
       printf '    password: "%s"\n    sni: %s\n    skip-cert-verify: %s\n' "$PASSWORD" "$VPN_DOMAIN" "$sci"

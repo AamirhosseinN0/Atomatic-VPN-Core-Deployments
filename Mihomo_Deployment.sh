@@ -584,6 +584,8 @@ readonly IRAN_KEYS
 # mixes iran listeners with ordinary ones tunes each of them correctly instead
 # of applying one profile's numbers to both.
 _is_ir() { [[ $1 == ir-* ]]; }
+# True when the current selection contains any iran listener.
+_any_ir() { local k; for k in $SELECTED; do _is_ir "$k" && return 0; done; return 1; }
 
 # Per-listener secret with the shared credential as the fallback.
 _ks() { printf '%s' "${K_SECRET[${1}:${2}]:-$3}"; }
@@ -1457,10 +1459,58 @@ resolve_selection() {
 }
 
 declare -A USED_TCP USED_UDP
+# Ports the CURRENTLY RUNNING mihomo holds. A reinstall replaces that service, so
+# everything it is listening on is about to be released and is free to hand out
+# again — including back to the same listener. Without this, a redeploy on a live
+# node reads its own listeners as occupied and moves every one of them to the
+# next candidate in its band, which silently invalidates every client config
+# already distributed and, for a pinned-port profile, destroys the comparison the
+# ports were chosen to make.
+#
+# The service is deliberately NOT stopped to free them early: the operator is
+# usually connected through it while answering the prompts.
+declare -A OUR_TCP=() OUR_UDP=()
+
+# `ss -p` only names processes for root, which a deploy is. Where it cannot see
+# them the sets stay empty and the old, cautious behaviour applies.
+_scan_our_ports() {
+  OUR_TCP=(); OUR_UDP=()
+  have ss || return 0
+  local pid n
+  pid="$(systemctl show -p MainPID --value mihomo 2>/dev/null || true)"
+  [[ $pid =~ ^[0-9]+$ ]] && (( pid > 0 )) || pid=""
+  while read -r n; do [[ -n $n ]] && OUR_TCP[$n]=1; done < <(_our_ports_of tcp "$pid")
+  while read -r n; do [[ -n $n ]] && OUR_UDP[$n]=1; done < <(_our_ports_of udp "$pid")
+  local c=$(( ${#OUR_TCP[@]} + ${#OUR_UDP[@]} ))
+  (( c > 0 )) && log "Reclaiming ${c} port(s) from the running mihomo — they are released when it restarts."
+  return 0
+}
+
+_our_ports_of() {
+  local l4=$1 pid=$2 flag="-lunp"
+  [[ $l4 == tcp ]] && flag="-ltnp"
+  # Match the service's own PID where systemd reports one, and fall back to the
+  # binary name so a manually started mihomo is recognised too.
+  ss $flag 2>/dev/null | awk -v pid="$pid" '
+    /users:/ {
+      keep = 0
+      if (pid != "" && index($0, "pid=" pid ",") > 0) keep = 1
+      if (index($0, "\"mihomo\"") > 0) keep = 1
+      if (keep) { n = $4; sub(/.*:/, "", n); if (n ~ /^[0-9]+$/) print n }
+    }'
+  return 0
+}
+
 _port_taken() {
   local l4=$1 n=$2
-  if [[ $l4 == tcp || $l4 == both ]]; then [[ -n ${USED_TCP[$n]:-} ]] && return 0; port_listening tcp "$n" && return 0; fi
-  if [[ $l4 == udp || $l4 == both ]]; then [[ -n ${USED_UDP[$n]:-} ]] && return 0; port_listening udp "$n" && return 0; fi
+  if [[ $l4 == tcp || $l4 == both ]]; then
+    [[ -n ${USED_TCP[$n]:-} ]] && return 0
+    [[ -n ${OUR_TCP[$n]:-} ]] || { port_listening tcp "$n" && return 0; }
+  fi
+  if [[ $l4 == udp || $l4 == both ]]; then
+    [[ -n ${USED_UDP[$n]:-} ]] && return 0
+    [[ -n ${OUR_UDP[$n]:-} ]] || { port_listening udp "$n" && return 0; }
+  fi
   return 1
 }
 # NOTE: the trailing `return 0` is load-bearing. Without it the final `[[ ]] &&`
@@ -1474,17 +1524,65 @@ _pick_free() {
   return 1
 }
 
+# What is holding a port, for an error message that can be acted on.
+_port_holder() {
+  local l4=$1 n=$2 flag="-lunp" out
+  [[ $l4 == tcp ]] && flag="-ltnp"
+  out="$(ss $flag 2>/dev/null | awk -v p=":$n\$" '$4 ~ p {print; exit}')"
+  [[ -n $out ]] || { printf 'unknown'; return 0; }
+  # users:(("mihomo",pid=123,fd=9)) -> mihomo
+  if [[ $out =~ users:\(\(\"([^\"]+)\" ]]; then printf '%s' "${BASH_REMATCH[1]}"
+  else printf 'another process'; fi
+}
+
 assign_ports() {
+  # The ports this deployment already published, before PORT is cleared. A port
+  # our own mihomo is listening on is NOT taken by somebody else — it is ours,
+  # and the running service is holding it only until this deploy restarts it.
+  # Without this, re-running on a live node reads every current listener as busy
+  # and slides each one to the next candidate in its band, silently invalidating
+  # every client config already handed out.
+  local -A SAVED=()
+  local k
+  for k in "${!PORT[@]}"; do SAVED[$k]="${PORT[$k]}"; done
+
   USED_TCP=(); USED_UDP=(); PORT=()
+  _scan_our_ports
   local key l4 chosen
   # Never hand out the port sshd is on, whatever the curated lists say.
   _port_reserve tcp "$(ssh_port)"
+
+  # Claim the saved ports first so nothing else can take them in the loop below.
   for key in $SELECTED; do
+    [[ -n ${SAVED[$key]:-} ]] || continue
     l4="$(proto_l4 "$key")"
+    PORT[$key]="${SAVED[$key]}"; _port_reserve "$l4" "${SAVED[$key]}"
+  done
+
+  for key in $SELECTED; do
+    [[ -n ${PORT[$key]:-} ]] && continue
+    l4="$(proto_l4 "$key")"
+    # A pinned-port listener must never slide. For the iran profile the port IS
+    # the experiment — 443 against 30443 only means something if both are the
+    # ports they claim to be — so a collision is a hard error naming what holds
+    # it, not a silent move to a random high port that looks like it worked.
+    if _is_ir "$key"; then
+      chosen="${K_PORTS[$key]}"
+      if _port_taken "$l4" "$chosen"; then
+        bad "${key} needs ${l4}/${chosen}, which is already in use by: $(_port_holder "$l4" "$chosen")"
+        bad "This profile pins its ports on purpose; moving one would destroy the"
+        bad "comparison it exists to make. Free the port, or drop that listener with"
+        bad "--protocols <the other keys>."
+        die "Pinned port ${l4}/${chosen} is not available."
+      fi
+      PORT[$key]="$chosen"; _port_reserve "$l4" "$chosen"
+      continue
+    fi
     chosen="$(_pick_free "$l4" ${K_PORTS[$key]} || true)"
     [[ -n $chosen ]] || die "Could not find a free ${l4} port for ${key}."
     PORT[$key]="$chosen"; _port_reserve "$l4" "$chosen"
   done
+  return 0
 }
 
 review_ports() {
@@ -2242,7 +2340,15 @@ collect_config() {
   resolve_decoy_mode
 
   if _xport_used mkcp || _xport_used kcptun || _xport_used mekya; then
-    printf '  %s-> %s packets in flight downstream, %s upstream (at mtu %s, tti %s)%s\n' \
+    # Only the derived listeners use these numbers. The iran ones carry pinned
+    # values, so printing the derived window next to them would describe a
+    # listener that does not exist.
+    local _n_derived=0 _k
+    for _k in $SELECTED; do
+      _is_ir "$_k" && continue
+      case "${K_XPORT[$_k]}" in mkcp|kcptun|mekya) _n_derived=$((_n_derived+1)) ;; esac
+    done
+    (( _n_derived > 0 )) && printf '  %s-> %s packets in flight downstream, %s upstream (at mtu %s, tti %s)%s\n' \
       "$C_D" "$(_pkts_down)" "$(_pkts_up)" "$KCP_MTU" "$MKCP_TTI" "$C_RST"
   fi
 
@@ -2261,13 +2367,25 @@ collect_config() {
   printf '  %-24s %s\n' "Client TUN MTU"  "$CLIENT_MTU"
   needs_any_cert && printf '  %-24s %s\n' "TLS certificate" "$CERT_MODE"
   [[ $has_reality == yes ]] && printf '  %-24s %s\n' "REALITY SNI" "$REALITY_SNI"
-  uses_decoy && printf '  %-24s %s\n' "Camouflage decoy" \
-    "$(_decoy_local && echo "local nginx (${VPN_DOMAIN})" || echo "${STEAL_SNI}:443")"
+  if _any_ir; then
+    # This profile gives each listener its own decoy, so one line naming one
+    # site would be wrong for every listener but the first.
+    printf '  %-24s %s\n' "Camouflage decoy" "per listener — see the port table above"
+  else
+    uses_decoy && printf '  %-24s %s\n' "Camouflage decoy" \
+      "$(_decoy_local && echo "local nginx (${VPN_DOMAIN})" || echo "${STEAL_SNI}:443")"
+  fi
   if _xport_used mkcp || _xport_used kcptun || _xport_used mekya; then
     printf '  %-24s %s\n' "Link profile" \
       "client ${CLI_DOWN_MBPS}/${CLI_UP_MBPS} Mbit/s down/up, ${PATH_RTT_MS} ms RTT"
-    printf '  %-24s %s\n' "KCP windows" \
+    local _kd=0 _kk
+    for _kk in $SELECTED; do
+      _is_ir "$_kk" || case "${K_XPORT[$_kk]}" in mkcp|kcptun|mekya) _kd=$((_kd+1)) ;; esac
+    done
+    (( _kd > 0 )) && printf '  %-24s %s\n' "KCP windows" \
       "$(_pkts_down)/$(_pkts_up) pkt down/up, mtu ${KCP_MTU}, tti ${MKCP_TTI}"
+    _any_ir && printf '  %-24s %s\n' "KCP (iran listeners)" \
+      "1024/1024 pkt symmetric, mtu 1232, tti 20, mode manual"
   fi
   printf '  %-24s %s\n' "TCP Brutal"      "$BRUTAL"
   printf '  %-24s %s\n' "Firewall"        "$FIREWALL"

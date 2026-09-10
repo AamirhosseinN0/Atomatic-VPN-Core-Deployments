@@ -621,7 +621,7 @@ sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols recommend
 |---|---|
 | `sampler` | **the default** — exactly one listener per base protocol (12) |
 | `iran` | Iran_FucedUPMODE — 11 pinned-port listeners tuned for Iranian mobile carriers |
-| `antidpi` | Iran Anti-DPI v2 — 14 pinned-port listeners (JLS / RestLS / ShadowQUIC / mKCP-dtls / kcptun), the six SNI-accepting ones doubled across two port bands (aliases `adpi`, `v2`) |
+| `antidpi` | Iran Anti-DPI v2 — 20 pinned-port listeners (JLS / RestLS / ShadowQUIC / mKCP / kcptun): six SNI-accepting ones doubled across two port bands, plus three carrier-tuned KCP pairs (Irancell / MCI / TCI) (aliases `adpi`, `v2`) |
 | `recommended` | a curated 14 covering every distinct technique |
 | `core` | the 8 classics the sing-box / Xray scripts also offer |
 | `all` | every valid combination (81) |
@@ -793,7 +793,29 @@ adpi-restls-vmess-9443    tcp/9443   vmess  + RestLS   -> download.visualstudio.
 adpi-jls-vless-8843       tcp/8843   vless  + JLS      -> datadoghq.com
 adpi-restls-anytls-7443   tcp/7443   anytls + RestLS   -> registry.npmjs.org
 adpi-squic-8444           udp/8444   shadowquic (JLS)  -> dl.google.com
+adpi-kcptun-ss-irancell   udp/38443  ss2022 + kcptun   FEC 5/7  salsa20 mtu1280 srtp*
+adpi-mkcp-vmess-irancell  udp/38444  vmess  + mKCP      srtp  up15/down40  mtu1280
+adpi-kcptun-ss-mci        udp/4443   ss2022 + kcptun   FEC 10/6 aes-128 mtu1350 dscp46
+adpi-mkcp-vmess-mci       udp/4444   vmess  + mKCP      dtls  up35/down70  mtu1350
+adpi-kcptun-ss-tci        udp/28443  ss2022 + kcptun   FEC 10/3 aes     mtu1400 i30
+adpi-mkcp-vmess-tci       udp/28444  vmess  + mKCP      none  up80/down120 mtu1400
 ```
+
+The last six are the **carrier-tuned KCP profiles** from the "Hardened UDP/KCP
+under Iranian DPI" blueprint — a kcptun and an mKCP listener each for the three
+operators, so you can measure which transport survives on *your* carrier:
+
+| Profile | Carrier | kcptun | mKCP | shared |
+|---|---|---|---|---|
+| A | MTN Irancell 4G (ultra-loss) | FEC **5/7**, `salsa20`, sndwnd/rcvwnd 1024, dscp 0, sock 4 MB | `srtp` hdr, cap 15/40, buf 4 MB | mtu **1280**, tti 20, mode manual, cong off |
+| B | MCI cellular (stealth) | FEC **10/6**, `aes-128`, sndwnd 1024 / rcvwnd 2048, dscp 46, conn 1, sock 8 MB | `dtls` hdr, cap 35/70, buf 8 MB | mtu **1350**, tti 20 |
+| C | TCI fixed-line (sustained) | FEC **10/3**, `aes`, sndwnd 2048 / rcvwnd 4096, conn 2, sock 16 MB | header `none`, cap 80/120, buf 16 MB | mtu **1400**, tti 30, `acknodelay: false` |
+
+kcptun `crypt` follows the blueprint (`salsa20` / `aes-128` / `aes` — all real
+kcp-go ciphers; the blueprint's `aes-128-gcm`, which does not exist in kcp-go, is
+not emitted). `conn` + `autoexpire` (60 / 120 / 300 s) are set client-side to
+resync on CGNAT rebinds. kcptun keeps the blueprint's own ephemeral ports
+(38443 / 4443 / 28443); each mKCP sibling sits on that port **+1**.
 
 **mKCP and kcptun carry no TLS/SNI, so they are single** — one mKCP on udp/4500
 (the IPSec NAT-T port carriers keep open) and one kcptun on udp/3478 (the
@@ -916,7 +938,7 @@ buttons; `e` opens the highlighted preset as an editable checklist, and `custom`
 ```
  ❯ (●) sampler       one listener per protocol family  12 listener(s)
    ( ) iran          Iran_FucedUPMODE — pinned ports, mobile-carrier tuning  11 listener(s)
-   ( ) antidpi       Iran Anti-DPI v2 — JLS/RestLS/ShadowQUIC/mKCP/kcptun, multi-SNI  14 listener(s)
+   ( ) antidpi       Iran Anti-DPI v2 — JLS/RestLS/ShadowQUIC/mKCP/kcptun + carrier KCP  20 listener(s)
    ( ) recommended   a curated spread of every distinct technique  14 listener(s)
    ( ) core          the classics the sing-box / Xray scripts also offer  8 listener(s)
    ( ) all           every valid combination in the catalogue  81 listener(s)

@@ -613,8 +613,14 @@ readonly IRAN_KEYS
 #      different Server Name — twelve distinct names, so a name burned on one
 #      does not take the rest with it. mKCP and kcptun carry no SNI and stay
 #      single on udp/4500 and udp/3478.
+#    * Three carrier-tuned KCP pairs from the "Hardened UDP/KCP under Iranian DPI"
+#      blueprint are added on top — a kcptun and an mKCP listener each for MTN
+#      Irancell (A: FEC 5/7, salsa20, srtp, mtu 1280), MCI (B: FEC 10/6, aes-128,
+#      dtls, mtu 1350) and TCI (C: FEC 10/3, aes, header none, mtu 1400) — so a
+#      full antidpi deploy is 20 listeners. Their per-carrier values live in the
+#      _adpi_* helpers, keyed off the profile tag in K_VAR (adpi-a/b/c).
 #
-#  All five transports are certificate-less, so an antidpi node needs no cert,
+#  All transports are certificate-less, so an antidpi node needs no cert,
 #  no Let's Encrypt order and no port 80 (collect_config drops CERT_MODE to self).
 # =============================================================================
 declare -a ADPI_KEYS=()
@@ -657,6 +663,27 @@ build_antidpi_catalogue() {
   _adpi_add adpi-jls-vless-8843      vless  tcp    jls    8843 datadoghq.com
   _adpi_add adpi-restls-anytls-7443  anytls tcp    restls 7443 registry.npmjs.org
   _adpi_add adpi-squic-8444          shadowquic quic jls  8444 dl.google.com
+  # --- Carrier-tuned KCP profiles (from the "Hardened UDP/KCP under Iranian DPI"
+  #     blueprint). Three (protocol x carrier) pairs, each with a kcptun and an
+  #     mKCP listener carrying that carrier's researched FEC / window / MTU / TTI
+  #     / header / crypt. Every parameter is looked up per key from the profile
+  #     tag (adpi-a/b/c); see _adpi_* helpers. kcptun keeps the blueprint's own
+  #     ephemeral ports; each mKCP sibling sits on that port +1.
+  #       A = MTN Irancell 4G  ultra-loss  FEC 5/7  salsa20  mtu 1280  srtp
+  #       B = MCI cellular     stealth     FEC 10/6 aes-128  mtu 1350  dtls
+  #       C = TCI fixed-line   sustained   FEC 10/3 aes      mtu 1400  none
+  _adpi_add adpi-kcptun-ss-irancell   ss    kcptun none 38443
+  K_VAR[adpi-kcptun-ss-irancell]="adpi-a"
+  _adpi_add adpi-mkcp-vmess-irancell  vmess mkcp   none 38444
+  K_VAR[adpi-mkcp-vmess-irancell]="adpi-a"
+  _adpi_add adpi-kcptun-ss-mci        ss    kcptun none 4443
+  K_VAR[adpi-kcptun-ss-mci]="adpi-b"
+  _adpi_add adpi-mkcp-vmess-mci       vmess mkcp   none 4444
+  K_VAR[adpi-mkcp-vmess-mci]="adpi-b"
+  _adpi_add adpi-kcptun-ss-tci        ss    kcptun none 28443
+  K_VAR[adpi-kcptun-ss-tci]="adpi-c"
+  _adpi_add adpi-mkcp-vmess-tci       vmess mkcp   none 28444
+  K_VAR[adpi-mkcp-vmess-tci]="adpi-c"
   return 0
 }
 build_antidpi_catalogue
@@ -695,15 +722,51 @@ _ks() { printf '%s' "${K_SECRET[${1}:${2}]:-$3}"; }
 # needed. iran keeps 1232.
 _kcp_mtu_of() {
   _is_ir "$1"   && { printf '1232'; return 0; }
+  [[ -n "$(_adpi_prof "$1")" ]] && { _adpi_mkcp_mtu "$1"; return 0; }
   _is_adpi "$1" && { printf '1280'; return 0; }
   printf '%s' "$KCP_MTU"
 }
 _mkcp_tti_of() {
+  [[ -n "$(_adpi_prof "$1")" ]] && { _adpi_mkcp_tti "$1"; return 0; }
   { _is_ir "$1" || _is_adpi "$1"; } && { printf '20'; return 0; }
   printf '%s' "$MKCP_TTI"
 }
 # antidpi's fixed KCP window, both directions (the spec's sndwnd/rcvwnd: 512).
 _adpi_wnd() { printf '512'; }
+
+# ---------------------------------------------------------------------------
+# antidpi carrier profiles — the three (protocol x carrier) KCP tunings from
+# the "Hardened UDP/KCP under Iranian DPI" blueprint. The profile tag lives in
+# K_VAR (adpi-a / adpi-b / adpi-c); every parameter is looked up per key here so
+# a listener carries exactly its carrier's researched numbers.
+#   A = MTN Irancell 4G ultra-loss, B = MCI cellular stealth, C = TCI fixed-line.
+# ---------------------------------------------------------------------------
+_adpi_prof() { case "${K_VAR[$1]:-}" in adpi-a) printf 'a' ;; adpi-b) printf 'b' ;; adpi-c) printf 'c' ;; esac; }
+
+# mKCP per-profile: header, MTU, TTI, capacities (spec's uplink/downlink), buffer.
+_adpi_mkcp_hdr()  { case "$(_adpi_prof "$1")" in a) printf 'srtp' ;; b) printf 'dtls' ;; c) printf 'none' ;; esac; }
+_adpi_mkcp_mtu()  { case "$(_adpi_prof "$1")" in a) printf '1280' ;; b) printf '1350' ;; c) printf '1400' ;; esac; }
+_adpi_mkcp_tti()  { case "$(_adpi_prof "$1")" in a) printf '20' ;; b) printf '20' ;; c) printf '30' ;; esac; }
+_adpi_mkcp_up()   { case "$(_adpi_prof "$1")" in a) printf '15' ;; b) printf '35' ;; c) printf '80' ;; esac; }
+_adpi_mkcp_down() { case "$(_adpi_prof "$1")" in a) printf '40' ;; b) printf '70' ;; c) printf '120' ;; esac; }
+# Socket / KCP buffer, from the spec's sockbuf column (4 / 8 / 16 MB).
+_adpi_buf()       { case "$(_adpi_prof "$1")" in a) printf '4194304' ;; b) printf '8388608' ;; c) printf '16777216' ;; esac; }
+
+# kcptun per-profile.
+_adpi_kcp_crypt()   { case "$(_adpi_prof "$1")" in a) printf 'salsa20' ;; b) printf 'aes-128' ;; c) printf 'aes' ;; esac; }
+_adpi_kcp_iv()      { case "$(_adpi_prof "$1")" in a) printf '20' ;; b) printf '20' ;; c) printf '30' ;; esac; }
+_adpi_kcp_snd()     { case "$(_adpi_prof "$1")" in a) printf '1024' ;; b) printf '1024' ;; c) printf '2048' ;; esac; }
+_adpi_kcp_rcv()     { case "$(_adpi_prof "$1")" in a) printf '1024' ;; b) printf '2048' ;; c) printf '4096' ;; esac; }
+_adpi_kcp_ds()      { case "$(_adpi_prof "$1")" in a) printf '5' ;; b) printf '10' ;; c) printf '10' ;; esac; }
+_adpi_kcp_ps()      { case "$(_adpi_prof "$1")" in a) printf '7' ;; b) printf '6' ;; c) printf '3' ;; esac; }
+_adpi_kcp_dscp()    { case "$(_adpi_prof "$1")" in a) printf '0' ;; b) printf '46' ;; c) printf '0' ;; esac; }
+_adpi_kcp_conn()    { case "$(_adpi_prof "$1")" in a) printf '1' ;; b) printf '1' ;; c) printf '2' ;; esac; }
+_adpi_kcp_stream()  { case "$(_adpi_prof "$1")" in a) printf '2097152' ;; b) printf '4194304' ;; c) printf '8388608' ;; esac; }
+_adpi_kcp_ka()      { case "$(_adpi_prof "$1")" in a) printf '10' ;; b) printf '10' ;; c) printf '15' ;; esac; }
+# acknodelay: on for the lossy cellular profiles, off for the low-loss fixed line.
+_adpi_kcp_ack()     { case "$(_adpi_prof "$1")" in c) printf 'false' ;; *) printf 'true' ;; esac; }
+# CGNAT rebind window — release a stale session and resync on the migrated tuple.
+_adpi_kcp_expire()  { case "$(_adpi_prof "$1")" in a) printf '60' ;; b) printf '120' ;; c) printf '300' ;; esac; }
 
 # Symmetric windows. The derived asymmetric split only works if the client
 # mirrors it inverted; where it does not, throughput collapses to the smaller of
@@ -753,6 +816,12 @@ _sni_of() {
 # leaves your numbers alone. Setting the timers next to a preset mode is not an
 # error; it is silently discarded, which is worse.
 _kcptun_timers_of() {
+  # Carrier profiles run mode manual with per-carrier interval and acknodelay.
+  if [[ -n "$(_adpi_prof "$1")" ]]; then
+    printf '      nodelay: 1\n      interval: %s\n      resend: 2\n      nc: 1\n' "$(_adpi_kcp_iv "$1")"
+    printf '      acknodelay: %s\n' "$(_adpi_kcp_ack "$1")"
+    return 0
+  fi
   _is_ir "$1" || return 0
   local iv=20
   # The 10/4 listener also halves the flush interval: it is the "path is bad"
@@ -843,6 +912,9 @@ proto_desc() {
       case "$v" in
         srtp-nocong)  xd="mKCP srtp, no cong." ;;
         dtls-nocong)  xd="mKCP dtls, no cong." ;;
+        adpi-a)       xd="mKCP srtp (Irancell 15/40)" ;;
+        adpi-b)       xd="mKCP dtls (MCI 35/70)" ;;
+        adpi-c)       xd="mKCP none (TCI 80/120)" ;;
         wechat-video) xd="mKCP wechat-video" ;;
         "")           xd="mKCP (UDP)" ;;
         *)            xd="mKCP ${v} header" ;;
@@ -860,6 +932,9 @@ proto_desc() {
         manual)      xd="KCPTun manual 10/3 i20" ;;
         manual-fec4) xd="KCPTun manual 10/4 i10" ;;
         adpi)        xd="KCPTun fast2 10/3" ;;
+        adpi-a)      xd="KCPTun 5/7 salsa20 (Irancell)" ;;
+        adpi-b)      xd="KCPTun 10/6 aes128 (MCI)" ;;
+        adpi-c)      xd="KCPTun 10/3 aes (TCI)" ;;
         *)      xd="KCPTun (UDP)" ;;
       esac ;;
     quic)      xd="QUIC" ;;
@@ -3410,7 +3485,9 @@ _pkts_up()   { _bdp_pkts "$(( SRV_DOWN_MBPS < CLI_UP_MBPS   ? SRV_DOWN_MBPS : CL
 # is itself DPI-classified and throttled on Iranian carriers, so wearing it as a
 # disguise attracts exactly the attention the disguise is meant to avoid.
 _mkcp_header_of() {
-  # antidpi wears dtls per the spec (on udp/4500, the IPSec NAT-T port).
+  # Carrier profiles carry their own header (srtp / dtls / none); the base
+  # antidpi mkcp wears dtls (on udp/4500, the IPSec NAT-T port).
+  [[ -n "$(_adpi_prof "$1")" ]] && { _adpi_mkcp_hdr "$1"; return 0; }
   _is_adpi "$1" && { printf 'dtls'; return 0; }
   case "${K_VAR[$1]:-srtp}" in
     dtls)         printf 'dtls' ;;
@@ -3436,6 +3513,8 @@ _mkcp_cong_of() {
 # fast2 (nodelay 1, 20 ms) and fast3 (nodelay 1, 10 ms) are what actually cut
 # retransmit latency, at the cost of a higher packet rate.
 _kcptun_mode_of() {
+  # Carrier profiles run mode manual so their explicit timers actually apply.
+  [[ -n "$(_adpi_prof "$1")" ]] && { printf 'manual'; return 0; }
   case "${K_VAR[$1]:-}" in
     manual|manual-fec4) printf 'manual' ;;
     fast3)              printf 'fast3'  ;;
@@ -3477,7 +3556,9 @@ _tier_for_loss() {
 # always a meaningful A/B rather than two arbitrary constants. At the top tier
 # there is nothing stronger worth offering, so the two converge.
 _kcptun_fec_of() {
-  # antidpi pins the spec's FEC 10/3 rather than deriving from --loss-pct.
+  # Carrier profiles pin their researched FEC ratio (A 5/7, B 10/6, C 10/3).
+  [[ -n "$(_adpi_prof "$1")" ]] && { printf '%s %s' "$(_adpi_kcp_ds "$1")" "$(_adpi_kcp_ps "$1")"; return 0; }
+  # The base antidpi kcptun pins the spec's FEC 10/3 rather than deriving it.
   _is_adpi "$1" && { printf '10 3'; return 0; }
   # The iran listeners pin FEC rather than deriving it from --loss-pct: 10/3 and
   # 10/4 are the two ends of the comparison being run, so a change to the loss
@@ -3505,8 +3586,9 @@ _kcptun_ps_of() { local f; f="$(_kcptun_fec_of "$1")"; printf '%s' "${f##* }"; }
 # drain window for a retired connection and is kept BELOW autoexpire; above it,
 # kcptun warns and retired sessions accumulate.
 _kcptun_rotates()  { [[ ${K_VAR[$1]:-} == rotate ]]; }
-# antidpi opens the spec's `conn: 2` parallel sessions (no port rotation).
-_kcptun_conn_of()  { _is_adpi "$1" && { printf '2'; return 0; }; _kcptun_rotates "$1" && printf '4' || printf '1'; }
+# Carrier profiles set conn per-carrier (A 1, B 1, C 2); the base antidpi kcptun
+# opens the spec's conn 2 parallel sessions. Neither rotates source ports.
+_kcptun_conn_of()  { [[ -n "$(_adpi_prof "$1")" ]] && { _adpi_kcp_conn "$1"; return 0; }; _is_adpi "$1" && { printf '2'; return 0; }; _kcptun_rotates "$1" && printf '4' || printf '1'; }
 
 # The client opens `conn` INDEPENDENT KCP sessions, each with its own window, so
 # the aggregate in flight is conn x window. Divide the client's windows by conn
@@ -3666,6 +3748,12 @@ EOF
       dp="$(_pkts_down)"; up="$(_pkts_up)"
       if _is_ir "$key"; then
         ucap="$(_ir_cap_down)"; dcap="$(_ir_cap_up)"; wbuf=4194304; rbuf=2097152
+      elif [[ -n "$(_adpi_prof "$key")" ]]; then
+        # Carrier profile: the blueprint's uplink/downlink capacity and its
+        # sockbuf (4/8/16 MB) as the KCP buffers. Symmetric on both ends, as the
+        # blueprint's own server and client configs are identical.
+        ucap="$(_adpi_mkcp_up "$key")"; dcap="$(_adpi_mkcp_down "$key")"
+        wbuf="$(_adpi_buf "$key")"; rbuf="$(_adpi_buf "$key")"
       elif _is_adpi "$key"; then
         # The spec's server mKCP block verbatim: uplink 50 / downlink 100, 4 MB
         # buffers both. Both are well under MKCP_CAP_MAX, so nothing is clamped.
@@ -3743,26 +3831,36 @@ EOF
       # conn / autoexpire / scavengettl are deliberately absent here.  They
       # exist in the listener struct but transport/kcptun/server.go never reads
       # them; only the client half acts on them, so they live in plugin-opts.
-      local dp up swnd rwnd nocomp dscp rate
+      local dp up crypt swnd rwnd nocomp dscp rate sockbuf smuxbuf streambuf ka
       dp="$(_pkts_down)"; up="$(_pkts_up)"
       if _is_ir "$key"; then
-        swnd="$(_ir_wnd)"; rwnd="$(_ir_wnd)"; nocomp=true; dscp=0; rate=5000000
+        crypt=aes-128; swnd="$(_ir_wnd)"; rwnd="$(_ir_wnd)"; nocomp=true; dscp=0; rate=5000000
+        sockbuf=16777216; smuxbuf=8388608; streambuf=2097152; ka=5
+      elif [[ -n "$(_adpi_prof "$key")" ]]; then
+        # Carrier profile: the blueprint's crypt / windows / dscp / sockbuf,
+        # compression on (nocomp: false), no rate cap (ratelimit 0). crypt is one
+        # of salsa20 / aes-128 / aes — all real kcp-go ciphers.
+        crypt="$(_adpi_kcp_crypt "$key")"; swnd="$(_adpi_kcp_snd "$key")"; rwnd="$(_adpi_kcp_rcv "$key")"
+        nocomp=false; dscp="$(_adpi_kcp_dscp "$key")"; rate=0
+        sockbuf="$(_adpi_buf "$key")"; smuxbuf="$(_adpi_buf "$key")"; streambuf="$(_adpi_kcp_stream "$key")"; ka="$(_adpi_kcp_ka "$key")"
       elif _is_adpi "$key"; then
         # The spec's kcptun block: 512 windows, compression ON (nocomp: false),
         # dscp 46, and no rate cap (ratelimit 0 = unlimited, as the spec omits
         # it — watch it with `mihomoctl amplification`). crypt stays aes-128:
         # kcp-go has no "aes-128-gcm", which is what the spec's text names, and
         # that value would fail to boot.
-        swnd="$(_adpi_wnd)"; rwnd="$(_adpi_wnd)"; nocomp=false; dscp=46; rate=0
+        crypt=aes-128; swnd="$(_adpi_wnd)"; rwnd="$(_adpi_wnd)"; nocomp=false; dscp=46; rate=0
+        sockbuf=16777216; smuxbuf=8388608; streambuf=2097152; ka=5
       else
-        swnd="$(_kcp_wnd "$dp")"; rwnd="$(_kcp_wnd "$up")"; nocomp=true; dscp=0
+        crypt=aes-128; swnd="$(_kcp_wnd "$dp")"; rwnd="$(_kcp_wnd "$up")"; nocomp=true; dscp=0
         rate="$(( $(_rate_down) / $(_kcptun_conn_of "$key") ))"
+        sockbuf=16777216; smuxbuf=8388608; streambuf=2097152; ka=10
       fi
       cat <<EOF
     kcp-tun:
       enable: true
       key: $(_ks "$key" kcpkey "$KCPTUN_KEY")
-      crypt: aes-128
+      crypt: ${crypt}
       mode: $(_kcptun_mode_of "$key")
       mtu: $(_kcp_mtu_of "$key")
       sndwnd: ${swnd}
@@ -3771,11 +3869,11 @@ EOF
       parityshard: $(_kcptun_ps_of "$key")
       nocomp: ${nocomp}
       ratelimit: ${rate}
-      sockbuf: 16777216
+      sockbuf: ${sockbuf}
       smuxver: 2
-      smuxbuf: 8388608
-      streambuf: 2097152
-      keepalive: $( { _is_ir "$key" || _is_adpi "$key"; } && printf 5 || printf 10)
+      smuxbuf: ${smuxbuf}
+      streambuf: ${streambuf}
+      keepalive: ${ka}
       dscp: ${dscp}
 EOF
       _kcptun_timers_of "$key"
@@ -4785,6 +4883,11 @@ EOF
       dp="$(_pkts_down)"; up="$(_pkts_up)"
       if _is_ir "$key"; then
         ucap="$(_ir_cap_up)"; dcap="$(_ir_cap_down)"; wbuf=2097152; rbuf=4194304
+      elif [[ -n "$(_adpi_prof "$key")" ]]; then
+        # Carrier profile: same capacities/buffers as the server side — the
+        # blueprint's own client and server configs are identical.
+        ucap="$(_adpi_mkcp_up "$key")"; dcap="$(_adpi_mkcp_down "$key")"
+        wbuf="$(_adpi_buf "$key")"; rbuf="$(_adpi_buf "$key")"
       elif _is_adpi "$key"; then
         # The spec's client mKCP block: uplink 20 / downlink 80, 4 MB buffers.
         ucap=20; dcap=80; wbuf=4194304; rbuf=4194304
@@ -4893,37 +4996,47 @@ mihomo_of() {
           # scavengettl appear ONLY here because only the client half acts on
           # them.  Enabling kcptun also forces udp-over-tcp on this outbound and
           # makes the listener UDP-only, both by construction upstream.
-          local _dp _up _n _nocomp _dscp _rate
+          local _n _crypt _snd _rcv _nocomp _dscp _rate _sockbuf _smuxbuf _streambuf _ka
           _n="$(_kcptun_conn_of "$key")"
-          printf '    plugin: kcptun\n    plugin-opts:\n'
-          printf '      key: "%s"\n      crypt: aes-128\n      mode: %s\n      mtu: %s\n' \
-            "$(_ks "$key" kcpkey "$KCPTUN_KEY")" "$(_kcptun_mode_of "$key")" "$(_kcp_mtu_of "$key")"
           if _is_ir "$key"; then
-            printf '      sndwnd: %s\n      rcvwnd: %s\n' "$(_ir_wnd)" "$(_ir_wnd)"
-            _nocomp=true; _dscp=0; _rate=5000000
+            _crypt=aes-128; _snd="$(_ir_wnd)"; _rcv="$(_ir_wnd)"; _nocomp=true; _dscp=0; _rate=5000000
+            _sockbuf=8388608; _smuxbuf=8388608; _streambuf=2097152; _ka=5
+          elif [[ -n "$(_adpi_prof "$key")" ]]; then
+            # Carrier profile: the blueprint's crypt / windows / dscp / buffers.
+            _crypt="$(_adpi_kcp_crypt "$key")"; _snd="$(_adpi_kcp_snd "$key")"; _rcv="$(_adpi_kcp_rcv "$key")"
+            _nocomp=false; _dscp="$(_adpi_kcp_dscp "$key")"; _rate=0
+            _sockbuf="$(_adpi_buf "$key")"; _smuxbuf="$(_adpi_buf "$key")"; _streambuf="$(_adpi_kcp_stream "$key")"; _ka="$(_adpi_kcp_ka "$key")"
           elif _is_adpi "$key"; then
-            # The spec's client kcptun block: 512 windows, compression on, dscp
+            # The base antidpi client kcptun: 512 windows, compression on, dscp
             # 46, no rate cap. crypt is aes-128 (see the server note).
-            printf '      sndwnd: %s\n      rcvwnd: %s\n' "$(_adpi_wnd)" "$(_adpi_wnd)"
-            _nocomp=false; _dscp=46; _rate=0
+            _crypt=aes-128; _snd="$(_adpi_wnd)"; _rcv="$(_adpi_wnd)"; _nocomp=false; _dscp=46; _rate=0
+            _sockbuf=8388608; _smuxbuf=8388608; _streambuf=2097152; _ka=5
           else
-            _dp="$(_kcp_wnd "$(_per_conn "$(_pkts_down)" "$_n")")"
-            _up="$(_kcp_wnd "$(_per_conn "$(_pkts_up)" "$_n")")"
-            printf '      sndwnd: %s\n      rcvwnd: %s\n' "$_up" "$_dp"
+            _crypt=aes-128
+            _snd="$(_kcp_wnd "$(_per_conn "$(_pkts_up)" "$_n")")"
+            _rcv="$(_kcp_wnd "$(_per_conn "$(_pkts_down)" "$_n")")"
             _nocomp=true; _dscp=0; _rate="$(( $(_rate_up) / _n ))"
+            _sockbuf=8388608; _smuxbuf=8388608; _streambuf=2097152; _ka=10
           fi
+          printf '    plugin: kcptun\n    plugin-opts:\n'
+          printf '      key: "%s"\n      crypt: %s\n      mode: %s\n      mtu: %s\n' \
+            "$(_ks "$key" kcpkey "$KCPTUN_KEY")" "$_crypt" "$(_kcptun_mode_of "$key")" "$(_kcp_mtu_of "$key")"
+          printf '      sndwnd: %s\n      rcvwnd: %s\n' "$_snd" "$_rcv"
           printf '      datashard: %s\n      parityshard: %s\n      nocomp: %s\n' \
             "$(_kcptun_ds_of "$key")" "$(_kcptun_ps_of "$key")" "$_nocomp"
           printf '      ratelimit: %s\n' "$_rate"
-          printf '      sockbuf: 8388608\n      smuxver: 2\n      smuxbuf: 8388608\n      streambuf: 2097152\n'
+          printf '      sockbuf: %s\n      smuxver: 2\n      smuxbuf: %s\n      streambuf: %s\n' "$_sockbuf" "$_smuxbuf" "$_streambuf"
           # keepalive under the 60 s idle window Iran's protocol whitelister
           # keeps per flow — a flow that goes quiet for longer is re-evaluated.
-          printf '      keepalive: %s\n      dscp: %s\n' "$( { _is_ir "$key" || _is_adpi "$key"; } && printf 5 || printf 10)" "$_dscp"
+          printf '      keepalive: %s\n      dscp: %s\n' "$_ka" "$_dscp"
           _kcptun_timers_of "$key"
           if _kcptun_rotates "$key"; then
             printf '      conn: %s\n      autoexpire: 25\n      scavengettl: 20\n' "$_n"
+          elif [[ -n "$(_adpi_prof "$key")" ]]; then
+            # The blueprint's conn + CGNAT-rebind autoexpire (60/120/300 s).
+            printf '      conn: %s\n      autoexpire: %s\n' "$_n" "$(_adpi_kcp_expire "$key")"
           elif _is_adpi "$key"; then
-            # The spec's `conn: 2` — parallel sessions, no source-port rotation.
+            # The base antidpi client: conn 2, parallel sessions, no rotation.
             printf '      conn: 2\n'
           fi ;;
         *:shadowtls)

@@ -335,7 +335,7 @@ After a deploy the script installs itself as `/usr/local/sbin/mihomoctl` (when r
 | `--channel <stable\|alpha\|pinned>` | `stable` | `alpha` = rolling `Prerelease-Alpha` build |
 | `--version <tag>` | — | Exact tag for `--channel pinned`, e.g. `v1.19.30` |
 | `--amd64-level <auto\|v1\|v2\|v3>` | `auto` | Plain `amd64` asset is a v3 build; see the amd64 trap |
-| `--protocols <sampler\|recommended\|core\|all\|list>` | `sampler` | Keys, families or security layers, comma-separated. Omit it on an interactive run to get the checkbox picker |
+| `--protocols <sampler\|iran\|antidpi\|recommended\|core\|all\|list>` | `sampler` | Keys, families or security layers, comma-separated. `iran` / `antidpi` are the pinned-port Iranian profiles. Omit it on an interactive run to get the checkbox picker |
 | `--no-picker` | picker on | Skip the checkbox picker; use the typed prompt |
 | `--listen <addr>` | `::` | Bare IP; `::` dual-stack, `0.0.0.0` v4-only |
 | `--cert-mode <letsencrypt\|self>` | `letsencrypt` | Only if a selected protocol wants a cert |
@@ -621,6 +621,7 @@ sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols recommend
 |---|---|
 | `sampler` | **the default** — exactly one listener per base protocol (12) |
 | `iran` | Iran_FucedUPMODE — 11 pinned-port listeners tuned for Iranian mobile carriers |
+| `antidpi` | Iran Anti-DPI v2 — 14 pinned-port listeners (JLS / RestLS / ShadowQUIC / mKCP-dtls / kcptun), the six SNI-accepting ones doubled across two port bands (aliases `adpi`, `v2`) |
 | `recommended` | a curated 14 covering every distinct technique |
 | `core` | the 8 classics the sing-box / Xray scripts also offer |
 | `all` | every valid combination (81) |
@@ -758,6 +759,97 @@ The profile is named `Iran_FucedUPMODE`; the CLI token is `iran` (aliases
 `iran-mobile`, `ir`) because the original name contains a `*`, which a shell
 expands before the script ever sees the word.
 
+### `antidpi` — Iran Anti-DPI v2
+
+```bash
+sudo bash Mihomo_Deployment.sh -y --domain vpn.example.com --protocols antidpi
+```
+
+A second pinned-port profile (`--protocols antidpi`, aliases `adpi` / `v2`),
+built to the "Circumventing DPI on Iranian Cellular Networks" specification: the
+five evasion transports it names — **RestLS**, **JLS**, **ShadowQUIC**,
+**mKCP**, **kcptun** — on the ports it names. Like `iran` it is a separate
+catalogue and is **not** part of `--protocols all`.
+
+Its guiding requirement is *SNI variety*. Iranian DPI does destination-based
+graylisting, so every listener that carries a Server Name presents a **different**
+one, drawn from the spec's Tier-1 list (device / OS-update / enterprise-cloud
+names millions of idle handsets already query). The six SNI-accepting listeners
+are **doubled across two port bands**, giving twelve distinct names — so a name
+burned on one node does not take the rest with it.
+
+```
+adpi-restls-vless-443     tcp/443    vless  + RestLS   -> teams.microsoft.com
+adpi-jls-trojan-2053      tcp/2053   trojan + JLS      -> login.live.com
+adpi-restls-vmess-2083    tcp/2083   vmess  + RestLS   -> graph.microsoft.com
+adpi-jls-vless-2087       tcp/2087   vless  + JLS      -> outlook.office.com
+adpi-restls-anytls-2096   tcp/2096   anytls + RestLS   -> www.bing.com
+adpi-squic-8443           udp/8443   shadowquic (JLS)  -> cloudflare-quic.com
+adpi-mkcp-vmess-4500      udp/4500   vmess  + mKCP dtls, congestion off
+adpi-kcptun-ss-3478       udp/3478   ss2022 + kcptun fast2, FEC 10/3
+adpi-restls-vless-8443    tcp/8443   vless  + RestLS   -> gateway.icloud.com
+adpi-jls-trojan-4443      tcp/4443   trojan + JLS      -> swdist.apple.com
+adpi-restls-vmess-9443    tcp/9443   vmess  + RestLS   -> download.visualstudio.microsoft.com
+adpi-jls-vless-8843       tcp/8843   vless  + JLS      -> datadoghq.com
+adpi-restls-anytls-7443   tcp/7443   anytls + RestLS   -> registry.npmjs.org
+adpi-squic-8444           udp/8444   shadowquic (JLS)  -> dl.google.com
+```
+
+**mKCP and kcptun carry no TLS/SNI, so they are single** — one mKCP on udp/4500
+(the IPSec NAT-T port carriers keep open) and one kcptun on udp/3478 (the
+STUN/WebRTC port real-time media keeps alive).
+
+#### What this profile pins, and where it departs from the spec
+
+- **MTU 1280 everywhere.** The spec names several MTUs (1350, 1280, …); on the
+  measured path anything above 1280 black-holes, so 1280 is used for *both* the
+  outer KCP/mKCP datagram *and* the inner client TUN. This overrides the spec's
+  1350 and the `iran` profile's 1232.
+- **mKCP** wears the `dtls` header with `congestion: false` (the spec's choice),
+  server capacities 50/100 and 4 MB buffers; the client mirror carries 20/80.
+- **kcptun** runs `mode: fast2`, FEC 10/3, compression on (`nocomp: false`),
+  `dscp: 46`, `conn: 2`, 512 windows — the spec's block verbatim, with one
+  correction: `crypt` is **`aes-128`**, not the spec's `aes-128-gcm` (kcp-go has
+  no `-gcm` cipher, and that value fails to boot). No rate cap is set, as the
+  spec omits one — watch it with `mihomoctl amplification`.
+- **ShadowQUIC** relays to its per-listener SNI via the source-verified
+  `jls-upstream:` block (mihomo's real schema; the spec's top-level `dest:` is a
+  different tool's). The client carries `zero-rtt: false`, `bbr-profile:
+  aggressive`, `disable-mtu-discovery: true` and `max-datagram-frame-size: 1280`.
+  Its `up`/`down` come from `--client-up-mbps` / `--client-down-mbps` (default
+  15/60) rather than the spec's fixed 40/100, so an over-declared uplink cannot
+  burst you into a policer — pass `--client-up-mbps 40 --client-down-mbps 100`
+  for the spec's exact figures.
+- **Certificate-less.** All five transports borrow a TLS identity or carry no
+  TLS, so an `antidpi` node needs no domain certificate, no Let's Encrypt order
+  and no port 80 — `CERT_MODE` drops to `self` automatically.
+- **Per-listener secrets.** Like `iran`, every listener gets its own UUID /
+  password / JLS credentials / RestLS record programme, so a leaked config for
+  one SNI/port does not hand over the others.
+
+#### Client DNS and routing (shared with `iran`)
+
+Selecting either Iranian profile switches the generated `client-mihomo.yaml` to
+the hardened DNS and routing the spec calls for:
+
+- **Plain UDP resolvers only** — `1.1.1.1` and `8.8.8.8` on `:53`. No DoH/DoT:
+  encrypted DNS fails closed on networks that block `:443` to public resolvers,
+  which is exactly this path. `fake-ip` still keeps the real hostname inside the
+  tunnel, so the local ISP resolver never sees it and `10.10.34.34`-style
+  poisoning has nothing to catch.
+- **`.ir` stays domestic** — filtered out of `fake-ip` and pinned to Shecan
+  (`10.202.10.202`) and 403 (`178.22.122.100`) so banking / gov / university
+  sites resolve and route inside Iran, via a `DOMAIN-SUFFIX,ir,DIRECT` rule that
+  needs no geo database.
+- **Browser QUIC dropped** — `AND,((NETWORK,UDP),(DST-PORT,443)),REJECT` forces
+  browsers off HTTP/3 (which stalls under mobile UDP throttling) back onto the
+  TCP tunnels. It matches app traffic to `:443/udp`, not the tunnel's own dial to
+  the ShadowQUIC servers, which sit on 8443/8444.
+
+Only mihomo-based clients can dial `antidpi` — JLS, RestLS, mKCP, kcptun and
+ShadowQUIC have no share-link grammar, so it is a `client-mihomo.yaml` import,
+not a subscription URL.
+
 ### The interactive menu
 
 Run the script with no flags and you get one screen holding **every setting it has** — with its
@@ -823,6 +915,8 @@ buttons; `e` opens the highlighted preset as an editable checklist, and `custom`
 
 ```
  ❯ (●) sampler       one listener per protocol family  12 listener(s)
+   ( ) iran          Iran_FucedUPMODE — pinned ports, mobile-carrier tuning  11 listener(s)
+   ( ) antidpi       Iran Anti-DPI v2 — JLS/RestLS/ShadowQUIC/mKCP/kcptun, multi-SNI  14 listener(s)
    ( ) recommended   a curated spread of every distinct technique  14 listener(s)
    ( ) core          the classics the sing-box / Xray scripts also offer  8 listener(s)
    ( ) all           every valid combination in the catalogue  81 listener(s)

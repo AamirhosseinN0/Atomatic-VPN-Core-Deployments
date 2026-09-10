@@ -579,6 +579,98 @@ build_iran_catalogue() {
 build_iran_catalogue
 readonly IRAN_KEYS
 
+# =============================================================================
+#  antidpi — Iran Anti-DPI v2  (JLS / RestLS / ShadowQUIC / mKCP / kcptun)
+#
+#  A second pinned-port profile, built to the "Circumventing DPI on Iranian
+#  Cellular Networks" spec: the five evasion transports it names, on the ports
+#  it names, expanded so that every TLS-camouflage listener presents a DIFFERENT
+#  Server Name — the "use more than one SNI" requirement — drawn from the spec's
+#  Tier-1 device / OS-update / enterprise-cloud list. Those are names millions of
+#  idle handsets query in the background, so a proxy hides in that noise rather
+#  than standing out under one over-used SNI.
+#
+#  Like `iran` this is a SEPARATE catalogue and is NOT part of `--protocols all`:
+#  every entry is one fixed (protocol x camouflage x port x SNI x tuning)
+#  instance chosen for one path.
+#
+#  Deliberate choices, from the spec's text and the operator's measured path:
+#    * every mtu is 1280 — the value the operator reports as working, above which
+#      packets black-hole. The spec's 1350 is overridden EVERYWHERE: the outer
+#      KCP/mKCP datagram (_kcp_mtu_of) and the inner client TUN (CLIENT_MTU).
+#    * mKCP wears the `dtls` header with congestion OFF, on udp/4500 — the IPSec
+#      NAT-T port carriers keep open for enterprise VPNs (_mkcp_header_of,
+#      _mkcp_cong_of).
+#    * kcptun runs mode fast2, FEC 10/3, compression on, dscp 46, on udp/3478 —
+#      the STUN/WebRTC port real-time media keeps alive.
+#    * ShadowQUIC (HTTP/3 masquerade) takes udp/8443 and udp/8444. TCP/8443 is
+#      also used (second band). That is safe here because every antidpi transport
+#      is certificate-less, so this profile never stands up a --decoy local nginx
+#      on 127.0.0.1:8443 to collide with.
+#    * TCP camouflage spreads over 443 / 2053 / 2083 / 2087 / 2096 (443 plus
+#      Cloudflare's published alt-HTTPS set), then a SECOND band on 8443 / 4443 /
+#      9443 / 8843 / 7443 that duplicates each SNI-accepting listener under a
+#      different Server Name — twelve distinct names, so a name burned on one
+#      does not take the rest with it. mKCP and kcptun carry no SNI and stay
+#      single on udp/4500 and udp/3478.
+#
+#  All five transports are certificate-less, so an antidpi node needs no cert,
+#  no Let's Encrypt order and no port 80 (collect_config drops CERT_MODE to self).
+# =============================================================================
+declare -a ADPI_KEYS=()
+
+# Same shape as _ir_add, but registers into ADPI_KEYS. The 6th argument is the
+# per-listener SNI / camouflage destination (K_DEST), so each JLS / RestLS /
+# ShadowQUIC listener relays failed probes to — and has its client present — its
+# own name. mKCP and kcptun carry no TLS, so they take no SNI.
+_adpi_add() {
+  local key=$1 base=$2 xport=$3 sec=$4 port=$5 sni=${6:-}
+  ADPI_KEYS+=("$key")
+  K_BASE[$key]="$base"; K_XPORT[$key]="$xport"; K_SEC[$key]="$sec"
+  K_PORTS[$key]="$port"; K_VAR[$key]=""; K_DEST[$key]="$sni"
+}
+
+build_antidpi_catalogue() {
+  ADPI_KEYS=()
+  # --- TCP TLS-camouflage, first SNI band (Cloudflare's alt-HTTPS ports) -----
+  _adpi_add adpi-restls-vless-443    vless  tcp    restls 443  teams.microsoft.com
+  _adpi_add adpi-jls-trojan-2053     trojan tcp    jls    2053 login.live.com
+  _adpi_add adpi-restls-vmess-2083   vmess  tcp    restls 2083 graph.microsoft.com
+  _adpi_add adpi-jls-vless-2087      vless  tcp    jls    2087 outlook.office.com
+  _adpi_add adpi-restls-anytls-2096  anytls tcp    restls 2096 www.bing.com
+  # --- UDP (the spec's three unified-config transports) ---------------------
+  _adpi_add adpi-squic-8443          shadowquic quic jls  8443 cloudflare-quic.com
+  _adpi_add adpi-mkcp-vmess-4500     vmess  mkcp   none   4500
+  K_VAR[adpi-mkcp-vmess-4500]="dtls-nocong"
+  _adpi_add adpi-kcptun-ss-3478      ss     kcptun none   3478
+  K_VAR[adpi-kcptun-ss-3478]="adpi"
+  # --- Second SNI band: a duplicate of each of the SIX SNI-accepting listeners
+  #     (the five TCP TLS-camouflage ones + ShadowQUIC) on its own port with a
+  #     different Server Name, so every SNI-carrying listener is doubled —
+  #     twelve distinct names in all. mKCP and kcptun carry no SNI and are NOT
+  #     duplicated. Cloudflare's blessed HTTPS-alt set is spent by the first
+  #     band, so these sit on other plausible-HTTPS ports, all kept under 10000
+  #     (the ceiling above which the spec says high-port TLS is flagged).
+  _adpi_add adpi-restls-vless-8443   vless  tcp    restls 8443 gateway.icloud.com
+  _adpi_add adpi-jls-trojan-4443     trojan tcp    jls    4443 swdist.apple.com
+  _adpi_add adpi-restls-vmess-9443   vmess  tcp    restls 9443 download.visualstudio.microsoft.com
+  _adpi_add adpi-jls-vless-8843      vless  tcp    jls    8843 datadoghq.com
+  _adpi_add adpi-restls-anytls-7443  anytls tcp    restls 7443 registry.npmjs.org
+  _adpi_add adpi-squic-8444          shadowquic quic jls  8444 dl.google.com
+  return 0
+}
+build_antidpi_catalogue
+readonly ADPI_KEYS
+
+# True for a listener in the antidpi profile, and for the selection containing
+# any. Every tuned value below is chosen per key, so a mix of antidpi, iran and
+# ordinary listeners tunes each correctly.
+_is_adpi()  { [[ $1 == adpi-* ]]; }
+_any_adpi() { local k; for k in $SELECTED; do _is_adpi "$k" && return 0; done; return 1; }
+# Either pinned-port Iranian profile — used where the client DNS / routing and
+# the pinned-port handling should apply to both.
+_iranish()  { _any_ir || _any_adpi; }
+
 # True for a listener that belongs to the iran profile. Every tuned value below
 # is selected per key rather than by a global mode flag, so a selection that
 # mixes iran listeners with ordinary ones tunes each of them correctly instead
@@ -596,8 +688,22 @@ _ks() { printf '%s' "${K_SECRET[${1}:${2}]:-$3}"; }
 # to survive the IPv6 case; on IPv4 the packet lands at 1260. This is the OUTER
 # datagram and is a different number from the client's TUN mtu of 1280 — one
 # does not follow the other.
-_kcp_mtu_of()  { _is_ir "$1" && printf '1232' || printf '%s' "$KCP_MTU"; }
-_mkcp_tti_of() { _is_ir "$1" && printf '20'   || printf '%s' "$MKCP_TTI"; }
+# antidpi pins 1280 — the operator's measured value, above which the path
+# black-holes. Unlike the iran profile's 1232 (1280 - 40 IPv6 - 8 UDP), the spec
+# and the operator both name 1280 as the number to set, so it is used verbatim
+# for the outer datagram; KCP fragments a 1280 inner packet across datagrams as
+# needed. iran keeps 1232.
+_kcp_mtu_of() {
+  _is_ir "$1"   && { printf '1232'; return 0; }
+  _is_adpi "$1" && { printf '1280'; return 0; }
+  printf '%s' "$KCP_MTU"
+}
+_mkcp_tti_of() {
+  { _is_ir "$1" || _is_adpi "$1"; } && { printf '20'; return 0; }
+  printf '%s' "$MKCP_TTI"
+}
+# antidpi's fixed KCP window, both directions (the spec's sndwnd/rcvwnd: 512).
+_adpi_wnd() { printf '512'; }
 
 # Symmetric windows. The derived asymmetric split only works if the client
 # mirrors it inverted; where it does not, throughput collapses to the smaller of
@@ -736,6 +842,7 @@ proto_desc() {
     mkcp)
       case "$v" in
         srtp-nocong)  xd="mKCP srtp, no cong." ;;
+        dtls-nocong)  xd="mKCP dtls, no cong." ;;
         wechat-video) xd="mKCP wechat-video" ;;
         "")           xd="mKCP (UDP)" ;;
         *)            xd="mKCP ${v} header" ;;
@@ -752,6 +859,7 @@ proto_desc() {
         fast3)  xd="KCPTun, mode fast3" ;;
         manual)      xd="KCPTun manual 10/3 i20" ;;
         manual-fec4) xd="KCPTun manual 10/4 i10" ;;
+        adpi)        xd="KCPTun fast2 10/3" ;;
         *)      xd="KCPTun (UDP)" ;;
       esac ;;
     quic)      xd="QUIC" ;;
@@ -1165,7 +1273,7 @@ Common options:
                                GOAMD64 build to fetch. 'auto' probes /proc/cpuinfo;
                                the plain 'amd64' asset upstream is a v3 build and
                                SIGILLs on pre-Haswell CPUs, hence this flag.
-      --protocols <sampler|iran|recommended|core|all|list>
+      --protocols <sampler|iran|antidpi|recommended|core|all|list>
                                'iran' = Iran_FucedUPMODE: 11 listeners on pinned
                                ports (443 / 2053 / 2083 / 2087 / 2096 for TCP,
                                3478 / 8801 / 8802 / 19302 / 41821 for UDP), each
@@ -1174,6 +1282,15 @@ Common options:
                                1024 windows, kcptun mode manual so the timers
                                actually apply, and paired controls so you can
                                tell a blocked PORT from a blocked protocol.
+                               Not included in 'all'.
+                               'antidpi' (aliases adpi, v2) = Iran Anti-DPI v2,
+                               built to the JLS / RestLS / ShadowQUIC / mKCP-dtls /
+                               kcptun spec: ${#ADPI_KEYS[@]} pinned-port listeners, the six
+                               SNI-accepting ones doubled across two port bands so
+                               twelve distinct Server Names are in play; MTU 1280
+                               everywhere, mKCP dtls with congestion off on 4500,
+                               kcptun fast2 FEC 10/3 on 3478, per-listener secrets.
+                               Certificate-less, so it needs no domain cert.
                                Not included in 'all'.
                                'sampler' (the default) = exactly one listener per
                                base protocol, so a first deploy is something you
@@ -1266,6 +1383,11 @@ list_protocols() {
     printf '     %-24s %-5s %-6s %s\n' "$k" "$(proto_l4 "$k")" "${K_PORTS[$k]}" "$(proto_desc "$k")"
   done
   printf '\n%d iran listeners.\n' "${#IRAN_KEYS[@]}"
+  printf '\n     %s%s%s\n' "$C_BOLD" "Iran Anti-DPI v2  (--protocols antidpi)  — pinned ports, one SNI each, not part of 'all'" "$C_RST"
+  for k in "${ADPI_KEYS[@]}"; do
+    printf '     %-24s %-5s %-6s %-38s %s\n' "$k" "$(proto_l4 "$k")" "${K_PORTS[$k]}" "$(proto_desc "$k")" "${K_DEST[$k]:+SNI ${K_DEST[$k]}}"
+  done
+  printf '\n%d antidpi listeners.\n' "${#ADPI_KEYS[@]}"
 }
 
 # -----------------------------------------------------------------------------
@@ -1337,6 +1459,8 @@ _expand_token() {
     # one to type.
     iran|iran-mobile|ir|"Iran_FucedUPMODE"|"Iran_Fuc*edUPMODE")
                     printf '%s\n' "${IRAN_KEYS[@]}"; return 0 ;;
+    antidpi|anti-dpi|adpi|v2|iran-v2|iran2)
+                    printf '%s\n' "${ADPI_KEYS[@]}"; return 0 ;;
     recommended|rec) printf '%s\n' $RECOMMENDED_KEYS; return 0 ;;
     core|classic)   printf '%s\n' $CORE_KEYS; return 0 ;;
     # families by base protocol
@@ -1562,11 +1686,11 @@ assign_ports() {
   for key in $SELECTED; do
     [[ -n ${PORT[$key]:-} ]] && continue
     l4="$(proto_l4 "$key")"
-    # A pinned-port listener must never slide. For the iran profile the port IS
-    # the experiment — 443 against 30443 only means something if both are the
-    # ports they claim to be — so a collision is a hard error naming what holds
-    # it, not a silent move to a random high port that looks like it worked.
-    if _is_ir "$key"; then
+    # A pinned-port listener must never slide. For the iran and antidpi profiles
+    # the port IS the point — 443 against 30443, or the spec's exact HTTPS/STUN/
+    # NAT-T ports — so a collision is a hard error naming what holds it, not a
+    # silent move to a random high port that looks like it worked.
+    if _is_ir "$key" || _is_adpi "$key"; then
       chosen="${K_PORTS[$key]}"
       if _port_taken "$l4" "$chosen"; then
         bad "${key} needs ${l4}/${chosen}, which is already in use by: $(_port_holder "$l4" "$chosen")"
@@ -1722,10 +1846,11 @@ _tui_row() {   # _tui_row <is-cursor> <text>
 
 # --- screen 1: which preset --------------------------------------------------
 _tui_presets() {
-  local -a tok=(sampler iran recommended core all custom)
+  local -a tok=(sampler iran antidpi recommended core all custom)
   local -a lbl=(
     "sampler       one listener per protocol family"
     "iran          Iran_FucedUPMODE — pinned ports, mobile-carrier tuning"
+    "antidpi       Iran Anti-DPI v2 — JLS/RestLS/ShadowQUIC/mKCP/kcptun, multi-SNI"
     "recommended   a curated spread of every distinct technique"
     "core          the classics the sing-box / Xray scripts also offer"
     "all           every valid combination in the catalogue"
@@ -1734,6 +1859,7 @@ _tui_presets() {
   local -a cnt=(
     "$(printf '%s' "$SAMPLER_KEYS" | wc -w)"
     "${#IRAN_KEYS[@]}"
+    "${#ADPI_KEYS[@]}"
     "$(printf '%s' "$RECOMMENDED_KEYS" | wc -w)"
     "$(printf '%s' "$CORE_KEYS" | wc -w)"
     "${#ALL_KEYS[@]}"
@@ -1876,10 +2002,11 @@ _tui_checklist() {   # _tui_checklist <space separated keys to pre-tick>
 _tui_collapse() {
   local want; want="$(printf '%s\n' ${PROTO_CHOICE//,/ } | sort | tr '\n' ' ')"
   local name have
-  for name in sampler iran recommended core all; do
+  for name in sampler iran antidpi recommended core all; do
     case "$name" in
       sampler)     have="$SAMPLER_KEYS" ;;
       iran)        have="${IRAN_KEYS[*]}" ;;
+      antidpi)     have="${ADPI_KEYS[*]}" ;;
       recommended) have="$RECOMMENDED_KEYS" ;;
       core)        have="$CORE_KEYS" ;;
       all)         have="${ALL_KEYS[*]}" ;;
@@ -1939,6 +2066,10 @@ _pick_protocols_typed() {
   echo "    ${C_BOLD}iran${C_RST}         Iran_FucedUPMODE — ${#IRAN_KEYS[@]} listeners on pinned ports (443, 2053,"
   echo "                 2083, 2087, 2096, 3478, 8801, 8802, 19302, 30443, 41821)"
   echo "                 with mobile-carrier tuning and per-listener secrets"
+  echo "    ${C_BOLD}antidpi${C_RST}      Iran Anti-DPI v2 — ${#ADPI_KEYS[@]} listeners: JLS / RestLS / ShadowQUIC /"
+  echo "                 mKCP-dtls / kcptun. The 6 SNI-accepting ones are doubled"
+  echo "                 across two port bands (12 distinct SNIs); mKCP+kcptun on"
+  echo "                 4500 / 3478. MTU 1280, per-listener secrets"
   echo "    ${C_BOLD}recommended${C_RST}  a curated $(printf '%s' "$RECOMMENDED_KEYS" | wc -w) that cover every distinct technique"
   echo "    ${C_BOLD}core${C_RST}         the $(printf '%s' "$CORE_KEYS" | wc -w) classics also offered by the sing-box / Xray scripts"
   echo "    ${C_BOLD}all${C_RST}          every combination (${#ALL_KEYS[@]} listeners, ${#ALL_KEYS[@]} ports)"
@@ -2345,7 +2476,7 @@ collect_config() {
     # listener that does not exist.
     local _n_derived=0 _k
     for _k in $SELECTED; do
-      _is_ir "$_k" && continue
+      { _is_ir "$_k" || _is_adpi "$_k"; } && continue
       case "${K_XPORT[$_k]}" in mkcp|kcptun|mekya) _n_derived=$((_n_derived+1)) ;; esac
     done
     (( _n_derived > 0 )) && printf '  %s-> %s packets in flight downstream, %s upstream (at mtu %s, tti %s)%s\n' \
@@ -2367,8 +2498,8 @@ collect_config() {
   printf '  %-24s %s\n' "Client TUN MTU"  "$CLIENT_MTU"
   needs_any_cert && printf '  %-24s %s\n' "TLS certificate" "$CERT_MODE"
   [[ $has_reality == yes ]] && printf '  %-24s %s\n' "REALITY SNI" "$REALITY_SNI"
-  if _any_ir; then
-    # This profile gives each listener its own decoy, so one line naming one
+  if _iranish; then
+    # These profiles give each listener its own decoy, so one line naming one
     # site would be wrong for every listener but the first.
     printf '  %-24s %s\n' "Camouflage decoy" "per listener — see the port table above"
   else
@@ -2380,12 +2511,14 @@ collect_config() {
       "client ${CLI_DOWN_MBPS}/${CLI_UP_MBPS} Mbit/s down/up, ${PATH_RTT_MS} ms RTT"
     local _kd=0 _kk
     for _kk in $SELECTED; do
-      _is_ir "$_kk" || case "${K_XPORT[$_kk]}" in mkcp|kcptun|mekya) _kd=$((_kd+1)) ;; esac
+      { _is_ir "$_kk" || _is_adpi "$_kk"; } || case "${K_XPORT[$_kk]}" in mkcp|kcptun|mekya) _kd=$((_kd+1)) ;; esac
     done
     (( _kd > 0 )) && printf '  %-24s %s\n' "KCP windows" \
       "$(_pkts_down)/$(_pkts_up) pkt down/up, mtu ${KCP_MTU}, tti ${MKCP_TTI}"
     _any_ir && printf '  %-24s %s\n' "KCP (iran listeners)" \
       "1024/1024 pkt symmetric, mtu 1232, tti 20, mode manual"
+    _any_adpi && printf '  %-24s %s\n' "KCP (antidpi listeners)" \
+      "mKCP dtls cong-off cap 50/100, kcptun fast2 512 win FEC 10/3, mtu 1280, tti 20"
   fi
   printf '  %-24s %s\n' "TCP Brutal"      "$BRUTAL"
   printf '  %-24s %s\n' "Firewall"        "$FIREWALL"
@@ -2766,7 +2899,7 @@ gen_credentials() {
   # Only ever fills a blank, so a re-run keeps every secret already published.
   local k _b
   for k in $SELECTED; do
-    _is_ir "$k" || continue
+    { _is_ir "$k" || _is_adpi "$k"; } || continue
     case "${K_BASE[$k]}" in
       vless|vmess) [[ -n ${K_SECRET[${k}:uuid]:-} ]] || K_SECRET[${k}:uuid]="$(gen_uuid)" ;;
       trojan|anytls) [[ -n ${K_SECRET[${k}:pw]:-} ]] || K_SECRET[${k}:pw]="$(gen_pass)" ;;
@@ -3277,6 +3410,8 @@ _pkts_up()   { _bdp_pkts "$(( SRV_DOWN_MBPS < CLI_UP_MBPS   ? SRV_DOWN_MBPS : CL
 # is itself DPI-classified and throttled on Iranian carriers, so wearing it as a
 # disguise attracts exactly the attention the disguise is meant to avoid.
 _mkcp_header_of() {
+  # antidpi wears dtls per the spec (on udp/4500, the IPSec NAT-T port).
+  _is_adpi "$1" && { printf 'dtls'; return 0; }
   case "${K_VAR[$1]:-srtp}" in
     dtls)         printf 'dtls' ;;
     wechat-video) printf 'wechat-video' ;;
@@ -3290,6 +3425,8 @@ _mkcp_header_of() {
 # retransmits into the loss, which is where 2-3x wire amplification comes from —
 # see `mihomoctl amplification`.
 _mkcp_cong_of() {
+  # antidpi runs congestion off (the spec's `congestion: false`).
+  _is_adpi "$1" && { printf 'false'; return 0; }
   case "${K_VAR[$1]:-}" in *nocong*) printf 'false' ;; *) printf 'true' ;; esac
 }
 
@@ -3340,6 +3477,8 @@ _tier_for_loss() {
 # always a meaningful A/B rather than two arbitrary constants. At the top tier
 # there is nothing stronger worth offering, so the two converge.
 _kcptun_fec_of() {
+  # antidpi pins the spec's FEC 10/3 rather than deriving from --loss-pct.
+  _is_adpi "$1" && { printf '10 3'; return 0; }
   # The iran listeners pin FEC rather than deriving it from --loss-pct: 10/3 and
   # 10/4 are the two ends of the comparison being run, so a change to the loss
   # estimate must not quietly move both of them.
@@ -3366,7 +3505,8 @@ _kcptun_ps_of() { local f; f="$(_kcptun_fec_of "$1")"; printf '%s' "${f##* }"; }
 # drain window for a retired connection and is kept BELOW autoexpire; above it,
 # kcptun warns and retired sessions accumulate.
 _kcptun_rotates()  { [[ ${K_VAR[$1]:-} == rotate ]]; }
-_kcptun_conn_of()  { _kcptun_rotates "$1" && printf '4' || printf '1'; }
+# antidpi opens the spec's `conn: 2` parallel sessions (no port rotation).
+_kcptun_conn_of()  { _is_adpi "$1" && { printf '2'; return 0; }; _kcptun_rotates "$1" && printf '4' || printf '1'; }
 
 # The client opens `conn` INDEPENDENT KCP sessions, each with its own window, so
 # the aggregate in flight is conn x window. Divide the client's windows by conn
@@ -3522,8 +3662,18 @@ EOF
       # flight, downlink-capacity is the receive window it advertises to the
       # peer, and the two ends of this path are a 1 Gbps VPS and a handset.
       # Hence: uplink here is the download direction, downlink here is upload.
-      local dp up
+      local dp up ucap dcap wbuf rbuf
       dp="$(_pkts_down)"; up="$(_pkts_up)"
+      if _is_ir "$key"; then
+        ucap="$(_ir_cap_down)"; dcap="$(_ir_cap_up)"; wbuf=4194304; rbuf=2097152
+      elif _is_adpi "$key"; then
+        # The spec's server mKCP block verbatim: uplink 50 / downlink 100, 4 MB
+        # buffers both. Both are well under MKCP_CAP_MAX, so nothing is clamped.
+        ucap=50; dcap=100; wbuf=4194304; rbuf=4194304
+      else
+        ucap="$(_mkcp_cap "$dp")"; dcap="$(_mkcp_cap "$up")"
+        wbuf="$(_kcp_buf "$dp")"; rbuf="$(_kcp_buf "$up")"
+      fi
       cat <<EOF
     mkcp-config:
       enable: true
@@ -3531,11 +3681,11 @@ EOF
       header: $(_mkcp_header_of "$key")
       mtu: $(_kcp_mtu_of "$key")
       tti: $(_mkcp_tti_of "$key")
-      uplink-capacity: $(_is_ir "$key" && _ir_cap_down || _mkcp_cap "$dp")
-      downlink-capacity: $(_is_ir "$key" && _ir_cap_up || _mkcp_cap "$up")
+      uplink-capacity: ${ucap}
+      downlink-capacity: ${dcap}
       congestion: $(_mkcp_cong_of "$key")
-      write-buffer: $(_is_ir "$key" && printf 4194304 || _kcp_buf "$dp")
-      read-buffer: $(_is_ir "$key" && printf 2097152 || _kcp_buf "$up")
+      write-buffer: ${wbuf}
+      read-buffer: ${rbuf}
 EOF
       ;;
     mekya)
@@ -3593,8 +3743,21 @@ EOF
       # conn / autoexpire / scavengettl are deliberately absent here.  They
       # exist in the listener struct but transport/kcptun/server.go never reads
       # them; only the client half acts on them, so they live in plugin-opts.
-      local dp up
+      local dp up swnd rwnd nocomp dscp rate
       dp="$(_pkts_down)"; up="$(_pkts_up)"
+      if _is_ir "$key"; then
+        swnd="$(_ir_wnd)"; rwnd="$(_ir_wnd)"; nocomp=true; dscp=0; rate=5000000
+      elif _is_adpi "$key"; then
+        # The spec's kcptun block: 512 windows, compression ON (nocomp: false),
+        # dscp 46, and no rate cap (ratelimit 0 = unlimited, as the spec omits
+        # it — watch it with `mihomoctl amplification`). crypt stays aes-128:
+        # kcp-go has no "aes-128-gcm", which is what the spec's text names, and
+        # that value would fail to boot.
+        swnd="$(_adpi_wnd)"; rwnd="$(_adpi_wnd)"; nocomp=false; dscp=46; rate=0
+      else
+        swnd="$(_kcp_wnd "$dp")"; rwnd="$(_kcp_wnd "$up")"; nocomp=true; dscp=0
+        rate="$(( $(_rate_down) / $(_kcptun_conn_of "$key") ))"
+      fi
       cat <<EOF
     kcp-tun:
       enable: true
@@ -3602,18 +3765,18 @@ EOF
       crypt: aes-128
       mode: $(_kcptun_mode_of "$key")
       mtu: $(_kcp_mtu_of "$key")
-      sndwnd: $(_is_ir "$key" && _ir_wnd || _kcp_wnd "$dp")
-      rcvwnd: $(_is_ir "$key" && _ir_wnd || _kcp_wnd "$up")
+      sndwnd: ${swnd}
+      rcvwnd: ${rwnd}
       datashard: $(_kcptun_ds_of "$key")
       parityshard: $(_kcptun_ps_of "$key")
-      nocomp: true
-      ratelimit: $(_is_ir "$key" && printf 5000000 || printf '%s' "$(( $(_rate_down) / $(_kcptun_conn_of "$key") ))")
+      nocomp: ${nocomp}
+      ratelimit: ${rate}
       sockbuf: 16777216
       smuxver: 2
       smuxbuf: 8388608
       streambuf: 2097152
-      keepalive: $(_is_ir "$key" && printf 5 || printf 10)
-      dscp: 0
+      keepalive: $( { _is_ir "$key" || _is_adpi "$key"; } && printf 5 || printf 10)
+      dscp: ${dscp}
 EOF
       _kcptun_timers_of "$key"
       ;;
@@ -3719,13 +3882,26 @@ lst_of() {
     shadowquic)
       # No certificate keys exist on this listener: JLS authenticates the peer
       # and the QUIC handshake runs under a self-generated P-256 pair.
+      #
+      # The spec's shadowquic uses a top-level `dest:`, which is not mihomo's
+      # schema — the peer it relays failed probes to is `jls-upstream`. Keeping
+      # the source-verified block reaches the spec's INTENT (relay to
+      # cloudflare-quic.com) with a config that actually boots. antidpi takes its
+      # SNI and its own JLS credentials per listener.
+      local squ sqp sqsni
+      if _is_adpi "$key"; then
+        squ="$(_ks "$key" jlsuser "$SQ_USER")"; sqp="$(_ks "$key" jlspw "$SQ_PASSWORD")"
+        sqsni="$(_sni_of "$key")"
+      else
+        squ="$SQ_USER"; sqp="$SQ_PASSWORD"; sqsni="$STEAL_SNI"
+      fi
       cat <<EOF
     users:
-      - username: ${SQ_USER}
-        password: ${SQ_PASSWORD}
+      - username: ${squ}
+        password: ${sqp}
     jls-upstream:
-      addr: ${STEAL_SNI}:443
-      sni: ${STEAL_SNI}
+      addr: ${sqsni}:443
+      sni: ${sqsni}
     zero-rtt: true
     congestion-controller: bbr
 EOF
@@ -4605,8 +4781,17 @@ EOF
       # `uplink-capacity: 12` on a handset — the value both sides used to carry —
       # is roughly 630 KB in flight upward, which on a real Iranian uplink is
       # several seconds of queue that every DNS lookup then waits behind.
-      local dp up
+      local dp up ucap dcap wbuf rbuf
       dp="$(_pkts_down)"; up="$(_pkts_up)"
+      if _is_ir "$key"; then
+        ucap="$(_ir_cap_up)"; dcap="$(_ir_cap_down)"; wbuf=2097152; rbuf=4194304
+      elif _is_adpi "$key"; then
+        # The spec's client mKCP block: uplink 20 / downlink 80, 4 MB buffers.
+        ucap=20; dcap=80; wbuf=4194304; rbuf=4194304
+      else
+        ucap="$(_mkcp_cap "$up")"; dcap="$(_mkcp_cap "$dp")"
+        wbuf="$(_kcp_buf "$up")"; rbuf="$(_kcp_buf "$dp")"
+      fi
       cat <<EOF
     network: mkcp
     mkcp-opts:
@@ -4614,11 +4799,11 @@ EOF
       header: $(_mkcp_header_of "$key")
       mtu: $(_kcp_mtu_of "$key")
       tti: $(_mkcp_tti_of "$key")
-      uplink-capacity: $(_is_ir "$key" && _ir_cap_up || _mkcp_cap "$up")
-      downlink-capacity: $(_is_ir "$key" && _ir_cap_down || _mkcp_cap "$dp")
+      uplink-capacity: ${ucap}
+      downlink-capacity: ${dcap}
       congestion: $(_mkcp_cong_of "$key")
-      write-buffer: $(_is_ir "$key" && printf 2097152 || _kcp_buf "$up")
-      read-buffer: $(_is_ir "$key" && printf 4194304 || _kcp_buf "$dp")
+      write-buffer: ${wbuf}
+      read-buffer: ${rbuf}
 EOF
       ;;
     mekya)
@@ -4708,29 +4893,38 @@ mihomo_of() {
           # scavengettl appear ONLY here because only the client half acts on
           # them.  Enabling kcptun also forces udp-over-tcp on this outbound and
           # makes the listener UDP-only, both by construction upstream.
-          local _dp _up _n
+          local _dp _up _n _nocomp _dscp _rate
           _n="$(_kcptun_conn_of "$key")"
-          _dp="$(_kcp_wnd "$(_per_conn "$(_pkts_down)" "$_n")")"
-          _up="$(_kcp_wnd "$(_per_conn "$(_pkts_up)" "$_n")")"
           printf '    plugin: kcptun\n    plugin-opts:\n'
           printf '      key: "%s"\n      crypt: aes-128\n      mode: %s\n      mtu: %s\n' \
             "$(_ks "$key" kcpkey "$KCPTUN_KEY")" "$(_kcptun_mode_of "$key")" "$(_kcp_mtu_of "$key")"
           if _is_ir "$key"; then
             printf '      sndwnd: %s\n      rcvwnd: %s\n' "$(_ir_wnd)" "$(_ir_wnd)"
+            _nocomp=true; _dscp=0; _rate=5000000
+          elif _is_adpi "$key"; then
+            # The spec's client kcptun block: 512 windows, compression on, dscp
+            # 46, no rate cap. crypt is aes-128 (see the server note).
+            printf '      sndwnd: %s\n      rcvwnd: %s\n' "$(_adpi_wnd)" "$(_adpi_wnd)"
+            _nocomp=false; _dscp=46; _rate=0
           else
+            _dp="$(_kcp_wnd "$(_per_conn "$(_pkts_down)" "$_n")")"
+            _up="$(_kcp_wnd "$(_per_conn "$(_pkts_up)" "$_n")")"
             printf '      sndwnd: %s\n      rcvwnd: %s\n' "$_up" "$_dp"
+            _nocomp=true; _dscp=0; _rate="$(( $(_rate_up) / _n ))"
           fi
-          printf '      datashard: %s\n      parityshard: %s\n      nocomp: true\n' \
-            "$(_kcptun_ds_of "$key")" "$(_kcptun_ps_of "$key")"
-          if _is_ir "$key"; then printf '      ratelimit: 5000000\n'
-          else printf '      ratelimit: %s\n' "$(( $(_rate_up) / _n ))"; fi
+          printf '      datashard: %s\n      parityshard: %s\n      nocomp: %s\n' \
+            "$(_kcptun_ds_of "$key")" "$(_kcptun_ps_of "$key")" "$_nocomp"
+          printf '      ratelimit: %s\n' "$_rate"
           printf '      sockbuf: 8388608\n      smuxver: 2\n      smuxbuf: 8388608\n      streambuf: 2097152\n'
           # keepalive under the 60 s idle window Iran's protocol whitelister
           # keeps per flow — a flow that goes quiet for longer is re-evaluated.
-          printf '      keepalive: %s\n      dscp: 0\n' "$(_is_ir "$key" && printf 5 || printf 10)"
+          printf '      keepalive: %s\n      dscp: %s\n' "$( { _is_ir "$key" || _is_adpi "$key"; } && printf 5 || printf 10)" "$_dscp"
           _kcptun_timers_of "$key"
           if _kcptun_rotates "$key"; then
             printf '      conn: %s\n      autoexpire: 25\n      scavengettl: 20\n' "$_n"
+          elif _is_adpi "$key"; then
+            # The spec's `conn: 2` — parallel sessions, no source-port rotation.
+            printf '      conn: 2\n'
           fi ;;
         *:shadowtls)
           printf '    plugin: shadow-tls\n    plugin-opts:\n      host: %s\n      password: "%s"\n      version: 3\n      alpn: [%s]\n' \
@@ -4782,7 +4976,31 @@ mihomo_of() {
 EOF
       [[ $CERT_MODE == self && -n $CERT_PIN ]] && printf '    fingerprint: %s\n' "$CERT_PIN" ;;
     shadowquic)
-      cat <<EOF
+      if _is_adpi "$key"; then
+        # The spec's client ShadowQUIC block. zero-rtt is false (the spec's
+        # value, and it avoids the 0-RTT auth race on a mobile tower handoff).
+        # up/down come from --client-up/down-mbps rather than the spec's fixed
+        # 40/100 so an over-declared uplink cannot burst you into a policer —
+        # pass --client-up-mbps 40 --client-down-mbps 100 for the spec's figures.
+        # max-datagram-frame-size follows the 1280 MTU rule, not the spec's 1350.
+        cat <<EOF
+    username: $(_ks "$key" jlsuser "$SQ_USER")
+    password: "$(_ks "$key" jlspw "$SQ_PASSWORD")"
+    sni: $(_sni_of "$key")
+    zero-rtt: false
+    congestion-controller: bbr
+    bbr-profile: aggressive
+    up: "${CLI_UP_MBPS} Mbps"
+    down: "${CLI_DOWN_MBPS} Mbps"
+    max-datagram-frame-size: ${CLIENT_MTU}
+    disable-mtu-discovery: true
+    quic-versions:
+      - "v1"
+    alpn:
+      - h3
+EOF
+      else
+        cat <<EOF
     username: ${SQ_USER}
     password: "${SQ_PASSWORD}"
     sni: ${STEAL_SNI}
@@ -4791,6 +5009,7 @@ EOF
     alpn:
       - h3
 EOF
+      fi
       ;;
     mieru)
       local mt="TCP"; [[ ${K_XPORT[$key]} == udp ]] && mt="UDP"
@@ -5134,7 +5353,45 @@ EOF
     if valid_ipv4 "$VPN_IP"; then
       printf 'hosts:\n  %s: %s\n' "$VPN_DOMAIN" "$VPN_IP"
     fi
-    cat <<'EOF'
+    if _iranish; then
+      # Plain UDP resolvers ONLY — no DoH/DoT. Encrypted DNS fails closed on
+      # networks that block :443 to public resolvers, which is exactly this path,
+      # so 1.1.1.1 / 8.8.8.8 over plain :53 is what actually answers. The lookups
+      # never touch the local ISP resolver: fake-ip hands the app a synthetic
+      # address and the real name travels inside the tunnel, so there is nothing
+      # for 10.10.34.34-style poisoning to catch. .ir names are the exception —
+      # they are filtered out of fake-ip and pinned to domestic resolvers so
+      # banking / gov / university sites resolve and route inside Iran.
+      cat <<'EOF'
+dns:
+  enable: true
+  ipv6: false
+  prefer-h3: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '+.lan'
+    - '+.local'
+    - '+.ir'
+    - 'connectivitycheck.gstatic.com'
+    - 'msftconnecttest.com'
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  proxy-server-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  nameserver-policy:
+    '+.ir':
+      - 10.202.10.202
+      - 178.22.122.100
+proxies:
+EOF
+    else
+      cat <<'EOF'
 dns:
   enable: true
   ipv6: false
@@ -5158,6 +5415,7 @@ dns:
     - 9.9.9.9
 proxies:
 EOF
+    fi
   } >"$f"
   for key in $SELECTED; do
     if mihomo_of "$key" >>"$f" 2>/dev/null; then names+=("$(node_name "$key")"); fi
@@ -5185,6 +5443,16 @@ EOF
     for n in "${names[@]}"; do echo "      - \"$n\""; done
     echo "      - DIRECT"
     echo "rules:"
+    if _iranish; then
+      # Browser QUIC/HTTP3 stalls under Iranian mobile UDP throttling and hangs
+      # pages half-loaded; reject it so the browser falls straight back to HTTP/2
+      # over the TCP tunnels. (It matches app traffic to :443/udp, not the
+      # tunnel's own dial to the ShadowQUIC server, which sits on 8443.)
+      echo "  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"
+      # Domestic traffic stays direct — domain-suffix match, so no geo database
+      # has to be downloaded or held resident on the client.
+      echo "  - DOMAIN-SUFFIX,ir,DIRECT"
+    fi
     echo "  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve"
     echo "  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve"
     echo "  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve"
